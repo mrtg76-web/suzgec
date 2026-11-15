@@ -382,6 +382,100 @@ static void testDownsample()
     CHECK(held, "downsample holds 4 samples");
 }
 
+static double runRms(FilterBank& fb, double hz, int n, int from)
+{
+    auto l = sine(hz, 0.1, n);
+    std::vector<float> r;
+    run(fb, l, r, 64);
+    return rms(l, (size_t) from);
+}
+
+static void testKeyboardMode()
+{
+    FilterBank fb;
+    fb.prepare(kFs);
+    Params p = flat(0.8f);
+    p.keyboardMode = true;
+    p.resonance = 0.6f;
+    fb.setParams(p);
+    fb.reset();
+    // tuşa basılmadan bütün bantlar kapalı
+    CHECK(runRms(fb, 440, 9600, 4800) < 1e-4, "keyboard mode: closed without notes");
+
+    fb.noteOn(69, 1.f); // A4
+    const int b = FilterBank::nearestBand(440.0, 0);
+    const double on = runRms(fb, 440, 9600, 4800);
+    std::printf("kbd A4 -> band %d @ %.1f Hz, rms %.4f\n", b + 1, fb.bandFrequencyNow(b), on);
+    CHECK(std::fabs(fb.bandFrequencyNow(b) - 440.0) < 0.01, "retuned to 440");
+    CHECK(on > 0.03, "note opens band");
+    CHECK(runRms(fb, 1000, 9600, 4800) < on * 0.1, "other frequencies closed");
+
+    // aynı bantta ikinci nota öncelikli, bırakınca ilkine döner
+    fb.noteOn(70, 1.f);
+    std::vector<float> z(64, 0.f), e;
+    run(fb, z, e, 64);
+    CHECK(std::fabs(fb.bandFrequencyNow(b) - 466.16) < 0.05, "latest note wins (%f)", fb.bandFrequencyNow(b));
+    fb.noteOff(70);
+    run(fb, z, e, 64);
+    CHECK(std::fabs(fb.bandFrequencyNow(b) - 440.0) < 0.01, "back to held note");
+
+    // bırakınca sönüm (varsayılan 20 ms)
+    fb.noteOff(69);
+    CHECK(runRms(fb, 440, 9600, 4800) < on * 0.02, "release closes band");
+
+    // atak süresi
+    fb.setAttackSeconds(1.f);
+    fb.noteOn(69, 1.f);
+    const double early = runRms(fb, 440, 4800, 2400); // ilk 0.1 s
+    fb.setAttackSeconds(0.02f);
+    std::printf("attack 1 s: rms after 50-100 ms %.4f (full %.4f)\n", early, on);
+    CHECK(early < on * 0.5, "slow attack");
+    fb.allNotesOff();
+}
+
+static void testFixedBankMidi()
+{
+    FilterBank fb;
+    fb.prepare(kFs);
+    Params p = flat(0.f);
+    p.level[5] = 0.9f; // çizili bir bant
+    p.resonance = 0.6f;
+    fb.setParams(p);
+    fb.reset();
+    const int b = FilterBank::nearestBand(440.0, 0);
+    const double fb0 = bandFrequency(b);
+    CHECK(runRms(fb, fb0, 9600, 4800) < 1e-3, "band closed before note");
+    fb.noteOn(69, 1.f);
+    const double on = runRms(fb, fb0, 9600, 4800);
+    CHECK(on > 0.03, "MIDI opens fixed band (%f)", on);
+    CHECK(std::fabs(fb.bandFrequencyNow(b) - fb0) < 0.01, "fixed band not retuned");
+    fb.noteOff(69);
+    const double rel = runRms(fb, fb0, 9600, 4800);
+    CHECK(rel < on * 0.02, "release closes MIDI band (%f vs %f)", rel, on);
+    CHECK(runRms(fb, bandFrequency(5), 9600, 4800) > 0.03, "drawn band stays");
+    runRms(fb, 0.0, 48000, 0); // bant 6'nın çınlaması sönsün
+    // kullanıcı bandı yeniden çizince MIDI bırakır
+    p.level[(size_t) b] = 1.f;
+    fb.setParams(p);
+    CHECK(runRms(fb, fb0, 9600, 4800) > 0.03, "redraw returns band to user");
+}
+
+static void testDownsampleHold()
+{
+    Params p = flat(0.8f);
+    p.downsample = true;
+    p.downsampleHold = 8;
+    FilterBank fb;
+    fb.prepare(kFs * 2);
+    fb.setParams(p);
+    fb.reset();
+    auto l = sine(1000, 0.2, 4800), r = sine(700, 0.2, 4800);
+    run(fb, l, r, 100);
+    bool held = true;
+    for (size_t i = 0; i + 7 < l.size(); i += 8) held &= std::fabs(l[i] - l[i + 7]) < 1e-6f;
+    CHECK(held, "downsample holds 8 samples at 2x");
+}
+
 int main()
 {
     testFrequencies();
@@ -396,6 +490,9 @@ int main()
     testTrip();
     testRingMod();
     testDownsample();
+    testKeyboardMode();
+    testFixedBankMidi();
+    testDownsampleHold();
     testPerformance();
     std::printf(failures ? "\n%d FAILURE(S)\n" : "\nall tests passed\n", failures);
     return failures ? 1 : 0;

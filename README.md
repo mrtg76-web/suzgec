@@ -2,7 +2,7 @@
 
 Süzgeç, 48 bant geçiren filtreden oluşan bir ses efekti (VST3/AU). Bant merkezleri 55 Hz'den başlıyor ve 9:8 oranıyla (tam ses, 203.9 sent) ~13.9 kHz'e kadar diziliyor. Ekranda bir spektral şekil çizersin, gelen ses o şekle göre süzülür. Yüksek rezonansta camsı tınlamalar, derin vuruşlar ve metalik dokular çıkar.
 
-> **Faz 2.** Filtre bankası, çizim ekranı, Ana/Filtre/Pan, Ters Çevir, Trip modülasyonu, Ring Mod ve Downsample hazır. Spektral Yakalama (Analiz/Uygula), MIDI kontrolü, presetler ve oversampling 3. fazda gelecek.
+Kılavuzdaki bütün ses özellikleri var: filtre bankası, çizim, Ters Çevir, Trip, Ring Mod, Downsample, Spektral Yakalama, MIDI kontrolü (klavye modu ve sabit banka), presetler, parametre kilidi, rastgeleleştirici ve oversampling.
 
 ## Kurulum (Mac)
 
@@ -79,10 +79,58 @@ Sağdaki **Desen** ekranında noktalar her bandın faz kaymasını, çizgi o ank
 ### Downsample 1/4
 İşlenmiş sesi host örnekleme hızının dörtte birine düşürür (48 kHz projede 12 kHz). Filtre olmadan örnek tuttuğu için kasıtlı olarak kaba ve aliasing'li bir ses verir. Ring Mod ve Downsample karışımdan önce çalışır; dokuyu orijinalle harmanlamak için Karışım'ı düşür.
 
+### Spektral Yakalama (Analiz / Uygula)
+Bir sesin enerji dağılımını okuyup 48 bandın seviyelerine yazar. Ses kaydı değil, spektral bir şekil saklanır.
+
+1. Kaynak sesi Süzgeç'ten geçir. Başlarken Trip ve Klavye modu kapalı olsun.
+2. **ANALİZ**'e bas. Ekran gelen spektrumu gösterir. Kullanılabilir bir sinyal gelince düğme **UYGULA** olur.
+3. İstediğin spektrum ekrandayken **UYGULA**'ya bas. Analiz durur, şekil bant seviyelerine yazılır.
+4. Aynı Süzgeç'ten başka bir ses geçir ya da şekli preset olarak kaydedip başka track'te aç. Yeni ses yakalanan şekille süzülür.
+
+- Analiz sırasında **TERS ÇEVİR**: gösterilen şeklin tersini uygular ve analizi bitirir.
+- Ekranda çizmeye başlamak analizi uygulamadan durdurur. Analiz sırasında **ANALİZ…** düğmesine basmak da iptal eder.
+- Düğme ANALİZ… durumunda kalıyorsa Süzgeç'e ses gelmiyordur. Pencere açıkken, kaynak durmadan UYGULA'ya bas.
+- Ekranda en güçlü bant tepeye oturur; ondan 48 dB aşağısı sıfırdır.
+
+### MIDI kontrolü
+Süzgeç ses üretmez: MIDI bantları açıp kapatır, ses yine Süzgeç'ten geçmelidir. Yüksek rezonansla sürekli gürültü üzerine MIDI çalmayı dene (fabrika preseti **Gürültü Klavyesi**).
+
+**Ableton Live 10'da MIDI göndermek:** Yeni bir MIDI track aç. Track'in **MIDI To** menüsünden Süzgeç'in olduğu audio track'i, alttaki menüden **Suzgec**'i seç. MIDI track'te Monitor'u **In** yap ya da track'i kayda hazırla. Süzgeç listede çıkmazsa AU sürümünü kullan (Audio Units açık olmalı). Ekrandaki klavye MIDI track olmadan da çalışır.
+
+| | |
+|---|---|
+| **Klavye modu** (KLAVYE) | Ekranın altında A0–A8 klavyesi açılır. Bir nota en yakın bandı tam nota frekansına akort eder, velocity seviyesini belirler. Notası basılı olmayan bantlar kapanır. Çıkınca çizdiğin şekil geri gelir ve Kaydır yeniden açılır. |
+| **Nota bırakma** | Bırakılan notanın bandı, sönüm süresine göre kapanır. Aynı banda düşen notalarda en son basılan öncelikli; onu bırakınca basılı kalan önceki notaya döner. |
+| **Sabit banka** (KLAVYE kapalı) | MIDI en yakın sabit bandı akort etmeden açar. Diğer çizili bantlar olduğu gibi kalır. Notayı bırakınca o bant kapanır; o bandı ekranda yeniden çizince tekrar senin kontrolüne geçer. |
+| **Pitch wheel** | Perde bükmez; bant **atak** süresini ayarlar: en altta 20 ms, en üstte 5 sn. |
+| **Mod wheel (CC1)** | Bant **sönüm** süresini ayarlar: 20 ms – 5 sn. |
+
+Atak ve sönüm süreleri MIDI kullanılırken ekranın durum satırında görünür.
+
+### Presetler
+Üstteki çubuk: **<** / **>** önceki/sonraki preset, ortadaki isim tıklanınca liste açılır, **KAYDET** kullanıcı preseti kaydeder, **ZAR** rastgele bir ses üretir.
+
+- 12 fabrika preseti var (Cam Çanlar, Derin Gong, Metal Tel, Nefes Alan Spektrum, Lo-Fi Radyo, Gürültü Klavyesi…). Ableton'un program listesinde de görünürler.
+- Kullanıcı presetleri `~/Music/Suzgec/Presets/` klasörüne `.szpreset` olarak kaydedilir. Listeden **Preset klasörünü aç** ile Finder'da açabilirsin.
+- **ZAR**, bant şeklini, filtreyi, pan'ı, Trip'i, Ring Mod'u ve Downsample'ı rastgele ayarlar. Seviyeleri bozmamak için Giriş, Çıkış, Karışım ve Yumuşak Kırp'a dokunmaz.
+
+### Parametre kilidi
+Bir düğmeye ya da anahtara **sağ tıkla** → **Kilitle**. Kilitli parametreler preset değiştirirken, ZAR'da ve panodan yapıştırırken değişmez. Kilitli kontrollerin köşesinde kilit simgesi görünür.
+
+- **Hepsini kilitle / Bütün kilitleri aç** aynı menüde.
+- Ekrana sağ tıklamak 48 bant seviyesini birlikte kilitler. Böylece çizdiğin şekli koruyup presetlerin diğer ayarlarını deneyebilirsin.
+- Ring Mod bant seçimi, **RING MOD** anahtarının kilidine bağlıdır.
+
+### Değer girme
+Bir düğmeye **Shift+tık** (ya da sağ tık → **Değer gir…**) ya da değer yazısına çift tık: değeri elle yaz.
+
+### Oversampling
+**MENÜ → Oversampling**: Kapalı, 2x, 4x, 8x, 16x. Satürasyon ve ring mod gibi doğrusal olmayan işlemlerden doğan istenmeyen aliasing'i azaltır. Karşılığında işlemci yükü ve gecikme artar; gecikme Ableton'a bildirilir. 16x çok ağırdır. Downsample her zaman host örnekleme hızına bağlı kalır, oversampling onun kasıtlı kabalığını gidermez.
+
 ### Görünüm
 - **Renk düğmesi** (YEŞİL, TURUNCU, MAVİ, KIRMIZI, SARI, MOR, S/B): tıklayınca sonraki renk, sağ tıklayınca önceki renk.
 - **CRT:** tarama çizgileri ve ekran parıltısı.
-- **MENÜ:** pencere boyutu (Küçük/Standart/Büyük), preseti panoya kopyala / panodan yapıştır, bütün bantları %75'e sıfırla. Pencereyi sağ alt köşeden sürükleyerek de boyutlandırabilirsin.
+- **MENÜ:** oversampling, pencere boyutu (Küçük/Standart/Büyük), parlaklık, kontrast, preseti panoya kopyala / panodan yapıştır, bütün bantları %75'e sıfırla, bütün kilitleri aç. Pencereyi sağ alt köşeden sürükleyerek de boyutlandırabilirsin.
 - Düğmelerde çift tık varsayılan değere döndürür. Değer yazısına çift tıklayıp elle değer girebilirsin.
 
 Bu görünüm ayarları sesi etkilemez; projeyle birlikte kaydedilir.

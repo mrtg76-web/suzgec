@@ -165,6 +165,10 @@ float FilterBank::tripOffset(int b, float shape)
 FilterBank::FilterBank()
 {
     for (auto& m : tripView) m.store(1.f);
+    for (auto& m : levelView) m.store(0.f);
+    for (int b = 0; b < kNumBands; ++b) freqView[(size_t) b].store((float) bandFrequency(b));
+    for (auto& m : midiView) m.store(false);
+    noteBand.fill(-1);
     for (auto& m : outMeter) m.store(0.f);
     for (auto& m : inMeter) m.store(0.f);
     buildMakeupTable();
@@ -214,6 +218,9 @@ void FilterBank::prepare(double sampleRate)
     meterCoef = (float) (1.0 - std::exp(-1.0 / (0.05 * fs)));
     ringCoef = (float) (1.0 - std::exp(-1.0 / (0.05 * fs)));       // bırakma
     ringAttack = (float) (1.0 - std::exp(-1.0 / (0.001 * fs)));     // atak
+    fastCoef = (float) (1.0 - std::exp(-1.0 / (0.002 * fs)));
+    setAttackSeconds(attackSec.load());
+    setDecaySeconds(decaySec.load());
     reset();
 }
 
@@ -244,6 +251,8 @@ void FilterBank::reset()
     ringEnv = 0.f;
     dsCounter = 0;
     dsHoldL = dsHoldR = 0.f;
+    prevDrawn = target.level;
+    resetMidi();
     updateCoefficients(resonanceToQ(resSmoothed), target.shift);
     makeup = makeupGain(resSmoothed, target.slope24);
 }
@@ -256,21 +265,133 @@ void FilterBank::refreshNoise()
     }
 }
 
+void FilterBank::updateBand(int b)
+{
+    const double k = 1.0 / curQ;
+    const double fMax = 0.45 * fs;
+    const bool kb = target.keyboardMode;
+    double f = (kb && freqOverride[(size_t) b] > 0.0) ? freqOverride[(size_t) b] : bandFrequency(b, kb ? 0 : lastShift);
+    f = std::min(f, fMax);
+    const double g = std::tan(kPi * f / fs);
+    const double a1 = 1.0 / (1.0 + g * (g + k));
+    coeff[(size_t) b].k = (float) k;
+    coeff[(size_t) b].a1 = (float) a1;
+    coeff[(size_t) b].a2 = (float) (g * a1);
+    coeff[(size_t) b].a3 = (float) (g * g * a1);
+    freqView[(size_t) b].store((float) f, std::memory_order_relaxed);
+}
+
 void FilterBank::updateCoefficients(float q, int shift)
 {
-    const double k = 1.0 / q;
-    const double fMax = 0.45 * fs;
-    for (int b = 0; b < kNumBands; ++b) {
-        const double f = std::min(bandFrequency(b, shift), fMax);
-        const double g = std::tan(kPi * f / fs);
-        const double a1 = 1.0 / (1.0 + g * (g + k));
-        coeff[(size_t) b].k = (float) k;
-        coeff[(size_t) b].a1 = (float) a1;
-        coeff[(size_t) b].a2 = (float) (g * a1);
-        coeff[(size_t) b].a3 = (float) (g * g * a1);
-    }
+    curQ = q;
     lastQ = q;
     lastShift = shift;
+    for (int b = 0; b < kNumBands; ++b) updateBand(b);
+    coeffDirty = false;
+}
+
+// ---------------------------------------------------------------- MIDI
+void FilterBank::setParams(const Params& p)
+{
+    const bool modeChanged = p.keyboardMode != target.keyboardMode;
+    target = p;
+    if (modeChanged) resetMidi();
+}
+
+void FilterBank::resetMidi()
+{
+    for (auto& h : heldCount) h = 0;
+    noteBand.fill(-1);
+    envTarget.fill(0.f);
+    owned.fill(false);
+    freqOverride.fill(0.0);
+    coeffDirty = true;
+    if (!target.keyboardMode) env.fill(0.f);
+}
+
+int FilterBank::nearestBand(double hz, int shift)
+{
+    const double base = kBaseFreq * std::pow(2.0, shift / 12.0);
+    const double idx = std::log(hz / base) / std::log(kRatio);
+    return std::clamp((int) std::lround(idx), 0, kNumBands - 1);
+}
+
+void FilterBank::setAttackSeconds(float s)
+{
+    s = std::clamp(s, 0.02f, 5.f);
+    attackSec.store(s);
+    atkCoef = (float) (1.0 - std::exp(-4.6 / (s * fs))); // ~%99'a s saniyede
+}
+
+void FilterBank::setDecaySeconds(float s)
+{
+    s = std::clamp(s, 0.02f, 5.f);
+    decaySec.store(s);
+    decCoef = (float) (1.0 - std::exp(-4.6 / (s * fs)));
+}
+
+void FilterBank::noteOn(int note, float vel)
+{
+    if (note < 0 || note > 127) return;
+    if (vel <= 0.f) {
+        noteOff(note);
+        return;
+    }
+    const bool kb = target.keyboardMode;
+    if (kb && (note < 21 || note > 117)) return; // A0 .. A8
+    if (noteBand[(size_t) note] >= 0) noteOff(note);
+
+    const double hz = 440.0 * std::pow(2.0, (note - 69) / 12.0);
+    const int b = nearestBand(hz, kb ? 0 : target.shift);
+    auto& stack = held[(size_t) b];
+    int& cnt = heldCount[(size_t) b];
+    if (cnt == kStack) { // en eskiyi at
+        noteBand[(size_t) stack[0]] = -1;
+        for (int i = 1; i < kStack; ++i) stack[(size_t) i - 1] = stack[(size_t) i];
+        --cnt;
+    }
+    stack[(size_t) cnt++] = note;
+    noteBand[(size_t) note] = b;
+    noteVel[(size_t) note] = std::clamp(vel, 0.f, 1.f);
+    envTarget[(size_t) b] = noteVel[(size_t) note];
+    if (kb) {
+        freqOverride[(size_t) b] = hz;
+        updateBand(b);
+    } else {
+        owned[(size_t) b] = true;
+    }
+}
+
+void FilterBank::noteOff(int note)
+{
+    if (note < 0 || note > 127) return;
+    const int b = noteBand[(size_t) note];
+    if (b < 0) return;
+    noteBand[(size_t) note] = -1;
+    auto& stack = held[(size_t) b];
+    int& cnt = heldCount[(size_t) b];
+    for (int i = 0; i < cnt; ++i)
+        if (stack[(size_t) i] == note) {
+            for (int j = i + 1; j < cnt; ++j) stack[(size_t) j - 1] = stack[(size_t) j];
+            --cnt;
+            break;
+        }
+    if (cnt > 0) { // aynı bantta basılı kalan en son nota devralır
+        const int top = stack[(size_t) cnt - 1];
+        envTarget[(size_t) b] = noteVel[(size_t) top];
+        if (target.keyboardMode) {
+            freqOverride[(size_t) b] = 440.0 * std::pow(2.0, (top - 69) / 12.0);
+            updateBand(b);
+        }
+    } else {
+        envTarget[(size_t) b] = 0.f; // bant kapanır (akort, sönümü bitene kadar kalır)
+    }
+}
+
+void FilterBank::allNotesOff()
+{
+    for (int n = 0; n < 128; ++n)
+        if (noteBand[(size_t) n] >= 0) noteOff(n);
 }
 
 void FilterBank::process(float* left, float* right, int n)
@@ -281,8 +402,15 @@ void FilterBank::process(float* left, float* right, int n)
     const float blockCoef = 1.f - std::exp(-(float) n / (0.03f * (float) fs));
     resSmoothed += (target.resonance - resSmoothed) * blockCoef;
     const float q = resonanceToQ(resSmoothed);
-    if (target.shift != lastShift || std::fabs(q - lastQ) > lastQ * 1e-4f)
+    if (coeffDirty || target.shift != lastShift || std::fabs(q - lastQ) > lastQ * 1e-4f)
         updateCoefficients(q, target.shift);
+
+    // kullanıcı bir bandı yeniden çizdiyse MIDI o bandı bırakır
+    const bool kb = target.keyboardMode;
+    for (int b = 0; b < kNumBands; ++b) {
+        if (target.level[(size_t) b] != prevDrawn[(size_t) b] && heldCount[(size_t) b] == 0) owned[(size_t) b] = false;
+        prevDrawn[(size_t) b] = target.level[(size_t) b];
+    }
 
     const bool slope24 = target.slope24;
     if (slope24 != lastSlope24) {
@@ -313,6 +441,7 @@ void FilterBank::process(float* left, float* right, int n)
         const double cyc = std::floor(pos);
         tripCycle = (std::int64_t) cyc;
         tripPhase = pos - cyc;
+        target.tripLocked = false; // host bloğu başına bir kez (MIDI alt blokları fazı geri sarmasın)
     }
     const float dTI = (target.tripIntensity - tripI) * invN;
     const float dTP = (target.tripToPan - tripP) * invN;
@@ -376,7 +505,13 @@ void FilterBank::process(float* left, float* right, int n)
         for (int b = 0; b < kNumBands; ++b) {
             const auto& c = coeff[(size_t) b];
             float& lv = level[(size_t) b];
-            lv += (target.level[(size_t) b] - lv) * levelCoef;
+            float& e = env[(size_t) b];
+            const float et = envTarget[(size_t) b];
+            e += (et - e) * (et > e ? atkCoef : decCoef);
+            if (kb || owned[(size_t) b])
+                lv += (e - lv) * fastCoef;
+            else
+                lv += (target.level[(size_t) b] - lv) * levelCoef;
             float gain = levelCurve(lv);
             // bant numarası = b + 1 -> b tekse bant numarası çift
             float pan = (b & 1) ? panE : panO;
@@ -438,7 +573,7 @@ void FilterBank::process(float* left, float* right, int n)
                 dsHoldL = wetL;
                 dsHoldR = wetR;
             }
-            dsCounter = (dsCounter + 1) & 3;
+            if (++dsCounter >= std::max(1, target.downsampleHold)) dsCounter = 0;
             wetL = dsHoldL;
             wetR = dsHoldR;
         }
@@ -468,6 +603,8 @@ void FilterBank::process(float* left, float* right, int n)
         outMeter[(size_t) b].store(std::sqrt(envOut[(size_t) b]), std::memory_order_relaxed);
         inMeter[(size_t) b].store(std::sqrt(envIn[(size_t) b]), std::memory_order_relaxed);
         tripView[(size_t) b].store(lastTrip[(size_t) b], std::memory_order_relaxed);
+        levelView[(size_t) b].store(level[(size_t) b], std::memory_order_relaxed);
+        midiView[(size_t) b].store(kb || owned[(size_t) b], std::memory_order_relaxed);
     }
 }
 

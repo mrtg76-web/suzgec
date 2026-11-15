@@ -1,8 +1,10 @@
 #include "PluginProcessor.h"
 #include "PluginEditor.h"
+#include "Text.h"
 
 namespace {
-const juce::Identifier kPalette("palette"), kCrt("crt"), kUiWidth("uiWidth"), kRingMask("ringMask");
+const juce::Identifier kPalette("palette"), kCrt("crt"), kUiWidth("uiWidth"), kRingMask("ringMask"), kLocks("locks"),
+    kOversampling("oversampling"), kBrightness("brightness"), kContrast("contrast"), kPresetName("presetName");
 constexpr const char* kPresetPrefix = "SUZGEC1:";
 
 juce::String dbText(float v, int)
@@ -86,6 +88,9 @@ juce::AudioProcessorValueTreeState::ParameterLayout SuzgecProcessor::createLayou
     fl("tripToPan", "Trip To Pan", 0.f, 100.f, 0.f, pctText, "%");
     layout.add(std::make_unique<AudioParameterBool>(ParameterID { "ringOn", 1 }, "Ring Mod", false));
     layout.add(std::make_unique<AudioParameterBool>(ParameterID { "downsample", 1 }, "Downsample", false));
+
+    // --- Faz 3: MIDI klavye modu
+    layout.add(std::make_unique<AudioParameterBool>(ParameterID { "kbdMode", 1 }, "Keyboard Mode", false));
     return layout;
 }
 
@@ -114,6 +119,7 @@ SuzgecProcessor::SuzgecProcessor()
     pTripToPan = apvts.getRawParameterValue("tripToPan");
     pRingOn = apvts.getRawParameterValue("ringOn");
     pDownsample = apvts.getRawParameterValue("downsample");
+    pKbdMode = apvts.getRawParameterValue("kbdMode");
     for (int b = 0; b < sz::kNumBands; ++b) {
         pBands[(size_t) b] = apvts.getRawParameterValue(bandParamId(b));
         bandParams[(size_t) b] = apvts.getParameter(bandParamId(b));
@@ -153,19 +159,93 @@ sz::Params SuzgecProcessor::readParams() const
     p.ringOn = pRingOn->load() > 0.5f;
     p.ringMask = ringMask.load();
     p.downsample = pDownsample->load() > 0.5f;
+    p.keyboardMode = pKbdMode->load() > 0.5f;
     return p;
 }
 
-void SuzgecProcessor::prepareToPlay(double sampleRate, int)
+void SuzgecProcessor::prepareToPlay(double sampleRate, int samplesPerBlock)
 {
+    hostRate = sampleRate > 0 ? sampleRate : 48000.0;
+    maxBlock = juce::jmax(16, samplesPerBlock);
+    for (int i = 1; i < (int) oversamplers.size(); ++i) {
+        oversamplers[(size_t) i] = std::make_unique<juce::dsp::Oversampling<float>>(
+            2, (size_t) i, juce::dsp::Oversampling<float>::filterHalfBandPolyphaseIIR, true, true);
+        oversamplers[(size_t) i]->initProcessing((size_t) maxBlock);
+    }
+    keyboardState.reset();
+    osActive = -1;
+    activateOversampling(osRequested.load());
+}
+
+void SuzgecProcessor::activateOversampling(int index)
+{
+    index = juce::jlimit(0, 4, index);
+    osActive = index;
     bank.setParams(readParams());
-    bank.prepare(sampleRate);
+    bank.prepare(hostRate * (double) (1 << index));
+    int latency = 0;
+    if (index > 0 && oversamplers[(size_t) index]) {
+        oversamplers[(size_t) index]->reset();
+        latency = (int) std::lround(oversamplers[(size_t) index]->getLatencyInSamples());
+    }
+    setLatencySamples(latency);
+}
+
+void SuzgecProcessor::handleMidi(const juce::MidiMessage& m)
+{
+    if (m.isNoteOn())
+        bank.noteOn(m.getNoteNumber(), m.getFloatVelocity());
+    else if (m.isNoteOff())
+        bank.noteOff(m.getNoteNumber());
+    else if (m.isPitchWheel())
+        bank.setAttackSeconds(sz::FilterBank::wheelToSeconds((float) m.getPitchWheelValue() / 16383.f));
+    else if (m.isControllerOfType(1))
+        bank.setDecaySeconds(sz::FilterBank::wheelToSeconds((float) m.getControllerValue() / 127.f));
+    else if (m.isAllNotesOff() || m.isAllSoundOff())
+        bank.allNotesOff();
+}
+
+void SuzgecProcessor::processChunk(juce::AudioBuffer<float>& buffer, int start, int num, const juce::MidiBuffer& midi)
+{
+    const int numCh = juce::jmin(buffer.getNumChannels(), getTotalNumInputChannels(), 2);
+    if (numCh == 0) return;
+    const int factor = 1 << osActive;
+
+    float* l;
+    float* r;
+    juce::dsp::AudioBlock<float> block(buffer.getArrayOfWritePointers(), (size_t) numCh, (size_t) start, (size_t) num);
+    juce::dsp::AudioBlock<float> up;
+    if (osActive > 0) {
+        up = oversamplers[(size_t) osActive]->processSamplesUp(block);
+        l = up.getChannelPointer(0);
+        r = numCh > 1 ? up.getChannelPointer(1) : nullptr;
+    } else {
+        l = buffer.getWritePointer(0, start);
+        r = numCh > 1 ? buffer.getWritePointer(1, start) : nullptr;
+    }
+
+    // MIDI olaylarını örnek doğruluğunda uygula: olaylar arasında parça parça işle
+    int pos = 0;
+    for (const auto meta : midi) {
+        const int at = meta.samplePosition - start;
+        if (at < 0 || at >= num) continue;
+        if (at > pos) {
+            bank.process(l + pos * factor, r ? r + pos * factor : nullptr, (at - pos) * factor);
+            pos = at;
+        }
+        handleMidi(meta.getMessage());
+    }
+    if (pos < num) bank.process(l + pos * factor, r ? r + pos * factor : nullptr, (num - pos) * factor);
+
+    if (osActive > 0) oversamplers[(size_t) osActive]->processSamplesDown(block);
 }
 
 void SuzgecProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::MidiBuffer& midi)
 {
     juce::ScopedNoDenormals noDenormals;
-    midi.clear(); // MIDI 3. fazda
+    const int n = buffer.getNumSamples();
+    keyboardState.processNextMidiBuffer(midi, 0, n, true);
+    if (osRequested.load() != osActive) activateOversampling(osRequested.load());
 
     const int numIn = getTotalNumInputChannels();
     for (int ch = numIn; ch < getTotalNumOutputChannels(); ++ch) buffer.clear(ch, 0, buffer.getNumSamples());
@@ -190,12 +270,12 @@ void SuzgecProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::MidiB
         p.tripRateHz = bpm / 60.0 / beats;
     }
     tripRateShown.store((float) p.tripRateHz, std::memory_order_relaxed);
+    p.downsampleHold = 4 * (1 << osActive); // Downsample her zaman host hızının 1/4'ü
     bank.setParams(p);
 
-    if (buffer.getNumChannels() == 0) return;
-    float* l = buffer.getWritePointer(0);
-    float* r = buffer.getNumChannels() > 1 && numIn > 1 ? buffer.getWritePointer(1) : nullptr;
-    bank.process(l, r, buffer.getNumSamples());
+    // host beklenenden büyük blok gönderirse parçala
+    for (int start = 0; start < n; start += maxBlock) processChunk(buffer, start, juce::jmin(maxBlock, n - start), midi);
+    midi.clear();
 }
 
 // ---------------------------------------------------------------- bantlar
@@ -253,6 +333,75 @@ void SuzgecProcessor::loadRingMaskFromState()
     ringMask.store((std::uint64_t) hex.getHexValue64() & ((1ull << sz::kNumBands) - 1));
 }
 
+// ---------------------------------------------------------------- kilitler
+juce::StringArray SuzgecProcessor::allParamIds() const
+{
+    juce::StringArray ids;
+    for (auto* p : getParameters())
+        if (auto* rp = dynamic_cast<juce::RangedAudioParameter*>(p)) ids.add(rp->getParameterID());
+    return ids;
+}
+
+void SuzgecProcessor::setLocked(const juce::String& id, bool on)
+{
+    if (on)
+        locked.insert(id);
+    else
+        locked.erase(id);
+    storeLocks();
+}
+
+void SuzgecProcessor::setLockedMany(const juce::StringArray& ids, bool on)
+{
+    for (auto& id : ids) {
+        if (on)
+            locked.insert(id);
+        else
+            locked.erase(id);
+    }
+    storeLocks();
+}
+
+void SuzgecProcessor::lockAll(bool on) { setLockedMany(allParamIds(), on); }
+
+void SuzgecProcessor::storeLocks()
+{
+    juce::StringArray a;
+    for (auto& id : locked) a.add(id);
+    apvts.state.setProperty(kLocks, a.joinIntoString(","), nullptr);
+}
+
+void SuzgecProcessor::loadLocksFromState()
+{
+    locked.clear();
+    juce::StringArray a;
+    a.addTokens(apvts.state.getProperty(kLocks, "").toString(), ",", "");
+    for (auto& id : a)
+        if (id.isNotEmpty()) locked.insert(id);
+}
+
+// ---------------------------------------------------------------- ayarlar
+int SuzgecProcessor::getOversampling() const { return osRequested.load(); }
+void SuzgecProcessor::setOversampling(int i)
+{
+    i = juce::jlimit(0, 4, i);
+    osRequested.store(i);
+    apvts.state.setProperty(kOversampling, i, nullptr);
+}
+float SuzgecProcessor::getBrightness() const { return (float) apvts.state.getProperty(kBrightness, 1.0); }
+void SuzgecProcessor::setBrightness(float v) { apvts.state.setProperty(kBrightness, v, nullptr); }
+float SuzgecProcessor::getContrast() const { return (float) apvts.state.getProperty(kContrast, 1.0); }
+void SuzgecProcessor::setContrast(float v) { apvts.state.setProperty(kContrast, v, nullptr); }
+
+void SuzgecProcessor::setCurrentProgram(int i)
+{
+    if (juce::MessageManager::getInstanceWithoutCreating() != nullptr
+        && juce::MessageManager::getInstance()->isThisTheMessageThread())
+        presets.loadFactory(i);
+    else
+        juce::MessageManager::callAsync([this, i] { presets.loadFactory(i); });
+}
+
 // ---------------------------------------------------------------- arayüz ayarları
 int SuzgecProcessor::getPalette() const { return (int) apvts.state.getProperty(kPalette, 0); }
 void SuzgecProcessor::setPalette(int i) { apvts.state.setProperty(kPalette, i, nullptr); }
@@ -274,6 +423,8 @@ void SuzgecProcessor::setStateInformation(const void* data, int sizeInBytes)
         if (xml->hasTagName(apvts.state.getType())) {
             apvts.replaceState(juce::ValueTree::fromXml(*xml));
             loadRingMaskFromState();
+            loadLocksFromState();
+            osRequested.store(juce::jlimit(0, 4, (int) apvts.state.getProperty(kOversampling, 0)));
         }
 }
 
@@ -283,6 +434,7 @@ juce::String SuzgecProcessor::presetToString()
     state.removeProperty(kPalette, nullptr);
     state.removeProperty(kCrt, nullptr);
     state.removeProperty(kUiWidth, nullptr);
+    for (auto id : { kLocks, kOversampling, kBrightness, kContrast, kPresetName }) state.removeProperty(id, nullptr);
     juce::MemoryOutputStream mo;
     state.writeToStream(mo);
     return kPresetPrefix + mo.getMemoryBlock().toBase64Encoding();
@@ -296,20 +448,10 @@ bool SuzgecProcessor::presetFromString(const juce::String& text)
     if (!mb.fromBase64Encoding(t.fromFirstOccurrenceOf(kPresetPrefix, false, false))) return false;
     auto tree = juce::ValueTree::readFromData(mb.getData(), mb.getSize());
     if (!tree.isValid() || tree.getType() != apvts.state.getType()) return false;
-
-    // arayüz ayarlarını koru, sadece parametreleri değiştir
-    for (int i = 0; i < tree.getNumChildren(); ++i) {
-        auto child = tree.getChild(i);
-        const auto id = child.getProperty("id").toString();
-        if (auto* prm = apvts.getParameter(id)) {
-            const float v = (float) child.getProperty("value");
-            prm->beginChangeGesture();
-            prm->setValueNotifyingHost(prm->convertTo0to1(v));
-            prm->endChangeGesture();
-        }
-    }
-    const auto hex = tree.getProperty(kRingMask, "0").toString();
-    setRingMask((std::uint64_t) hex.getHexValue64());
+    PresetManager::Values v;
+    std::uint64_t mask = 0;
+    if (!PresetManager::treeToValues(tree, v, mask)) return false;
+    presets.apply(v, &mask, TR("Panodan"));
     return true;
 }
 

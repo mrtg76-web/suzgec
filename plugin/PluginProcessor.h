@@ -1,8 +1,13 @@
 #pragma once
 
 #include <juce_audio_processors/juce_audio_processors.h>
+#include <juce_audio_basics/juce_audio_basics.h>
+#include <juce_dsp/juce_dsp.h>
+
+#include <set>
 
 #include "FilterBank.h"
+#include "Presets.h"
 
 class SuzgecProcessor : public juce::AudioProcessor {
 public:
@@ -24,10 +29,10 @@ public:
     bool isMidiEffect() const override { return false; }
     double getTailLengthSeconds() const override { return 2.0; }
 
-    int getNumPrograms() override { return 1; }
-    int getCurrentProgram() override { return 0; }
-    void setCurrentProgram(int) override {}
-    const juce::String getProgramName(int) override { return {}; }
+    int getNumPrograms() override { return presets.numFactory(); }
+    int getCurrentProgram() override { return presets.currentFactoryIndex(); }
+    void setCurrentProgram(int i) override;
+    const juce::String getProgramName(int i) override { return presets.factoryName(i); }
     void changeProgramName(int, const juce::String&) override {}
 
     void getStateInformation(juce::MemoryBlock& destData) override;
@@ -50,6 +55,23 @@ public:
     // Trip'in o anki hızı (senkronda tempodan hesaplanan), Hz
     float getTripRateHz() const { return tripRateShown.load(std::memory_order_relaxed); }
 
+    // Parametre kilidi: kilitli parametreler preset/rastgele/yapıştır ile değişmez
+    bool isLocked(const juce::String& id) const { return locked.count(id) > 0; }
+    void setLocked(const juce::String& id, bool on);
+    void setLockedMany(const juce::StringArray& ids, bool on);
+    void lockAll(bool on);
+    juce::StringArray allParamIds() const;
+
+    // Oversampling: 0 = kapalı, 1 = 2x, 2 = 4x, 3 = 8x, 4 = 16x
+    int getOversampling() const;
+    void setOversampling(int index);
+
+    // Görüntü ayarları
+    float getBrightness() const;
+    void setBrightness(float);
+    float getContrast() const;
+    void setContrast(float);
+
     // Arayüz ayarları (projeyle birlikte saklanır, ses etkilemez)
     int getPalette() const;
     void setPalette(int index);
@@ -60,11 +82,26 @@ public:
 
     sz::FilterBank bank;
     juce::AudioProcessorValueTreeState apvts;
+    juce::MidiKeyboardState keyboardState; // ekrandaki klavye
+    PresetManager presets { *this };
 
 private:
     static juce::AudioProcessorValueTreeState::ParameterLayout createLayout();
     sz::Params readParams() const;
     void loadRingMaskFromState();
+    void loadLocksFromState();
+    void storeLocks();
+    void handleMidi(const juce::MidiMessage&);
+    void processChunk(juce::AudioBuffer<float>&, int start, int num, const juce::MidiBuffer&);
+    void activateOversampling(int index);
+
+    std::set<juce::String> locked;
+    std::array<std::unique_ptr<juce::dsp::Oversampling<float>>, 5> oversamplers;
+    std::atomic<int> osRequested { 0 };
+    int osActive = -1;
+    double hostRate = 48000.0;
+    int maxBlock = 512;
+    std::atomic<float>* pKbdMode = nullptr;
 
     std::atomic<std::uint64_t> ringMask { 0 };
     std::atomic<float> tripRateShown { 0.5f };

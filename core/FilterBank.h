@@ -6,6 +6,7 @@
 #include <atomic>
 #include <cstdint>
 #include <string>
+#include <cmath>
 #include <vector>
 
 namespace sz {
@@ -60,6 +61,10 @@ struct Params {
     bool ringOn = false;
     std::uint64_t ringMask = 0;  // bit b = bant b seçili
     bool downsample = false;
+    int downsampleHold = 4;      // kaç örnek tutulacak (4 x oversampling çarpanı)
+
+    // MIDI
+    bool keyboardMode = false;   // true: notalar en yakın bandı nota frekansına akort eder
 };
 
 class FilterBank {
@@ -68,7 +73,17 @@ public:
 
     void prepare(double sampleRate);
     void reset();
-    void setParams(const Params& p) { target = p; }
+    void setParams(const Params& p);
+
+    // --- MIDI (ses iş parçacığında, process çağrıları arasında)
+    void noteOn(int note, float velocity01);
+    void noteOff(int note);
+    void allNotesOff();
+    void setAttackSeconds(float s);  // pitch wheel: 0.02 .. 5
+    void setDecaySeconds(float s);   // mod wheel (CC1): 0.02 .. 5
+    static float wheelToSeconds(float t01) { return 0.02f * std::pow(250.f, t01); }
+    // Notanın gideceği bant (sabit bankada shift dikkate alınır)
+    static int nearestBand(double hz, int shiftSemitones);
 
     // left/right yerinde işlenir. right == nullptr ise mono.
     void process(float* left, float* right, int numSamples);
@@ -78,6 +93,11 @@ public:
     float inputMeter(int band) const { return inMeter[(size_t) band].load(std::memory_order_relaxed); }
     float tripFactor(int band) const { return tripView[(size_t) band].load(std::memory_order_relaxed); }
     float tripPhaseNow() const { return phaseView.load(std::memory_order_relaxed); }
+    float effectiveLevel(int band) const { return levelView[(size_t) band].load(std::memory_order_relaxed); }
+    float bandFrequencyNow(int band) const { return freqView[(size_t) band].load(std::memory_order_relaxed); }
+    bool bandMidiDriven(int band) const { return midiView[(size_t) band].load(std::memory_order_relaxed); }
+    float attackSeconds() const { return attackSec.load(std::memory_order_relaxed); }
+    float decaySeconds() const { return decaySec.load(std::memory_order_relaxed); }
 
     // Tüm bantlar %100 iken toplamı yaklaşık birim kazanca getiren telafi
     float makeupGain(float resonance01, bool slope24) const;
@@ -90,6 +110,8 @@ private:
     struct State { float ic1 = 0.f, ic2 = 0.f; };
 
     void updateCoefficients(float q, int shift);
+    void updateBand(int b);
+    void resetMidi();
     void buildMakeupTable();
     void refreshNoise();
 
@@ -126,6 +148,22 @@ private:
     std::array<float, kNumBands> envOut{}, envIn{}, lastTrip{};
     std::array<std::atomic<float>, kNumBands> outMeter, inMeter, tripView;
     std::atomic<float> phaseView { 0.f };
+    std::array<std::atomic<float>, kNumBands> levelView, freqView;
+    std::array<std::atomic<bool>, kNumBands> midiView;
+
+    // MIDI durumu
+    static constexpr int kStack = 8;
+    std::array<float, kNumBands> env{}, envTarget{}, prevDrawn{};
+    std::array<double, kNumBands> freqOverride{};   // 0 = yok
+    std::array<bool, kNumBands> owned{};            // sabit bankada MIDI'nin devraldığı bant
+    std::array<std::array<int, kStack>, kNumBands> held{};
+    std::array<int, kNumBands> heldCount{};
+    std::array<int, 128> noteBand{};
+    std::array<float, 128> noteVel{};
+    bool coeffDirty = true;
+    float atkCoef = 0.f, decCoef = 0.f, fastCoef = 0.f;
+    float curQ = 2.f;
+    std::atomic<float> attackSec { 0.02f }, decaySec { 0.02f };
 
     static constexpr int kTableSize = 65;
     float makeupTable[2][kTableSize]{};

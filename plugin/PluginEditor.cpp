@@ -28,12 +28,20 @@ juce::Font CrtLook::mono(float size, bool bold)
                                         bold ? juce::Font::bold : juce::Font::plain));
 }
 
-void CrtLook::setPhosphor(juce::Colour c)
+void CrtLook::setPhosphor(juce::Colour c, float brightness, float contrast)
 {
-    ph = c;
-    // fosfor rengine çok hafif bürünmüş siyah zemin
-    bg = juce::Colour(0xff050706).interpolatedWith(c, 0.035f);
-    pn = juce::Colour(0xff0b0f0d).interpolatedWith(c, 0.06f);
+    ph = brightness <= 1.f ? c.withMultipliedBrightness(brightness) : c.brighter(brightness - 1.f);
+    // fosfor rengine çok hafif bürünmüş siyah zemin; kontrast düştükçe zemin açılır
+    const float lift = juce::jmax(0.f, 1.f - contrast) * 0.35f;
+    bg = juce::Colour(0xff050706).interpolatedWith(c, 0.035f / juce::jmax(0.5f, contrast)).brighter(lift);
+    pn = juce::Colour(0xff0b0f0d).interpolatedWith(c, 0.06f / juce::jmax(0.5f, contrast)).brighter(lift);
+    if (contrast > 1.f) {
+        bg = bg.darker(contrast - 1.f);
+        pn = pn.darker((contrast - 1.f) * 0.6f);
+    }
+    setColour(juce::AlertWindow::backgroundColourId, pn);
+    setColour(juce::AlertWindow::textColourId, ph);
+    setColour(juce::AlertWindow::outlineColourId, ph.withAlpha(0.5f));
 
     setColour(juce::ResizableWindow::backgroundColourId, bg);
     setColour(juce::Label::textColourId, ph);
@@ -131,6 +139,48 @@ BandDisplay::BandDisplay(SuzgecProcessor& p, CrtLook& l) : proc(p), look(l)
     startTimerHz(30);
 }
 
+void BandDisplay::timerCallback()
+{
+    if (analysis != Analysis::Off) {
+        // gelen spektrum: en güçlü banda göre dB, 48 dB'lik aralık 0..1'e
+        float mx = 0.f;
+        std::array<float, sz::kNumBands> m {};
+        for (int b = 0; b < sz::kNumBands; ++b) {
+            m[(size_t) b] = proc.bank.inputMeter(b);
+            mx = juce::jmax(mx, m[(size_t) b]);
+        }
+        if (mx > 3e-4f) { // yaklaşık -70 dBFS: kullanılabilir sinyal
+            for (int b = 0; b < sz::kNumBands; ++b) {
+                const float rel = m[(size_t) b] > 1e-9f ? 20.f * std::log10(m[(size_t) b] / mx) : -120.f;
+                const float v = juce::jlimit(0.f, 1.f, 1.f + rel / 48.f);
+                auto& a = analysed[(size_t) b];
+                a = analysis == Analysis::Waiting ? v : a * 0.7f + v * 0.3f;
+            }
+            analysis = Analysis::Ready;
+        }
+    }
+    repaint();
+}
+
+void BandDisplay::startAnalysis()
+{
+    analysed.fill(0.f);
+    analysis = Analysis::Waiting;
+}
+
+void BandDisplay::applyAnalysis(bool inverted)
+{
+    if (analysis == Analysis::Ready)
+        for (int b = 0; b < sz::kNumBands; ++b) {
+            auto* prm = proc.bandParam(b);
+            const float v = analysed[(size_t) b];
+            prm->beginChangeGesture();
+            prm->setValueNotifyingHost(inverted ? 1.f - v : v);
+            prm->endChangeGesture();
+        }
+    analysis = Analysis::Off;
+}
+
 BandDisplay::~BandDisplay() { endGestures(); }
 
 juce::Rectangle<float> BandDisplay::plotArea() const
@@ -202,6 +252,12 @@ void BandDisplay::mouseExit(const juce::MouseEvent&)
 
 void BandDisplay::mouseDown(const juce::MouseEvent& e)
 {
+    if (e.mods.isPopupMenu()) {
+        if (onRightClick) onRightClick();
+        return;
+    }
+    // çizmek analizi uygulamadan durdurur
+    if (analysis != Analysis::Off) analysis = Analysis::Off;
     dragging = true;
     lastPt = downPt = e.position;
     pendingClick = false;
@@ -219,7 +275,7 @@ void BandDisplay::mouseDown(const juce::MouseEvent& e)
 
 void BandDisplay::mouseDrag(const juce::MouseEvent& e)
 {
-    if (e.mods.isAltDown()) return;
+    if (e.mods.isAltDown() || e.mods.isPopupMenu() || !dragging) return;
     if (pendingClick) {
         if (e.position.getDistanceFrom(downPt) < 4.f) return;
         pendingClick = false;
@@ -230,6 +286,7 @@ void BandDisplay::mouseDrag(const juce::MouseEvent& e)
 
 void BandDisplay::mouseUp(const juce::MouseEvent& e)
 {
+    if (!dragging) return;
     if (pendingClick) {
         proc.toggleRingBand(bandAt(downPt.x));
         pendingClick = false;
@@ -270,11 +327,19 @@ void BandDisplay::paint(juce::Graphics& g)
     // bantlar
     const bool tripOn = proc.apvts.getRawParameterValue("tripOn")->load() > 0.5f;
     const bool ringOn = proc.apvts.getRawParameterValue("ringOn")->load() > 0.5f;
+    const bool kbd = proc.apvts.getRawParameterValue("kbdMode")->load() > 0.5f;
+    const bool analysing = analysis != Analysis::Off;
     const auto mask = proc.getRingMask();
+    bool anyMidi = kbd;
     for (int b = 0; b < sz::kNumBands; ++b) {
         const float lvl = proc.getBandLevel(b);
-        // Trip açıkken dolgu canlı (modüle edilmiş) seviyeyi, ince çizgi kayıtlı seviyeyi gösterir
-        const float shown = tripOn ? lvl * proc.bank.tripFactor(b) : lvl;
+        const bool midiBand = proc.bank.bandMidiDriven(b);
+        anyMidi |= midiBand;
+        // dolgu: canlı seviye (Trip ve MIDI dahil); ince çizgi: kayıtlı (çizilen) seviye
+        float shown = midiBand ? proc.bank.effectiveLevel(b) : lvl;
+        if (tripOn) shown *= proc.bank.tripFactor(b);
+        if (analysing) shown = analysed[(size_t) b];
+        const bool showStored = !analysing && (tripOn || midiBand);
         const float x = p.getX() + b * bw;
         const auto col = juce::Rectangle<float>(x, p.getY(), bw, p.getHeight());
         const bool selected = ((mask >> b) & 1u) != 0;
@@ -296,7 +361,7 @@ void BandDisplay::paint(juce::Graphics& g)
         }
 
         const auto bar = col.reduced(bw * 0.14f, 0.f).withTop(p.getBottom() - shown * p.getHeight());
-        g.setColour(ph.withAlpha(0.20f));
+        g.setColour(ph.withAlpha(analysing ? 0.45f : 0.20f));
         g.fillRect(bar);
         if (crt) {
             g.setColour(ph.withAlpha(0.22f));
@@ -304,7 +369,7 @@ void BandDisplay::paint(juce::Graphics& g)
         }
         g.setColour(ph);
         g.fillRect(bar.withHeight(2.5f));
-        if (tripOn) {
+        if (showStored) {
             g.setColour(ph.withAlpha(0.5f));
             g.fillRect(col.reduced(bw * 0.14f, 0.f).withTop(p.getBottom() - lvl * p.getHeight()).withHeight(1.f));
         }
@@ -339,11 +404,12 @@ void BandDisplay::paint(juce::Graphics& g)
     g.setFont(CrtLook::mono(13.f));
     g.setColour(ph);
     juce::String left;
-    if (hoverBand >= 0) {
-        const int shift = proc.apvts.getRawParameterValue("shift")->load() > 1.5f    ? 1
-                          : proc.apvts.getRawParameterValue("shift")->load() < 0.5f ? -1
-                                                                                     : 0;
-        const double hz = sz::bandFrequency(hoverBand, shift);
+    if (analysis == Analysis::Waiting) {
+        left = TR("ANALİZ: ses bekleniyor… (sinyal Süzgeç'ten geçmeli)");
+    } else if (analysis == Analysis::Ready && hoverBand < 0) {
+        left = TR("ANALİZ: istediğin an UYGULA  ·  TERS ÇEVİR = tersini uygula");
+    } else if (hoverBand >= 0) {
+        const double hz = proc.bank.bandFrequencyNow(hoverBand);
         const juce::String f = hz >= 1000 ? juce::String(hz / 1000.0, 2) + " kHz" : juce::String(hz, 1) + " Hz";
         left = TR("BANT ") + juce::String(hoverBand + 1).paddedLeft('0', 2) + "   " + f + "   "
              + juce::String(sz::noteName(hz)) + "   %"
@@ -354,7 +420,6 @@ void BandDisplay::paint(juce::Graphics& g)
     } else {
         left = TR("ekranda sürükleyerek çiz  ·  alt+tık: bandı %75'e döndür");
     }
-    g.drawText(left, status, juce::Justification::centredLeft);
 
     const float res = proc.apvts.getRawParameterValue("resonance")->load();
     juce::String right = "Q " + juce::String(sz::resonanceToQ(res * 0.01f), 1) + "   "
@@ -363,6 +428,13 @@ void BandDisplay::paint(juce::Graphics& g)
         const float hz = proc.getTripRateHz();
         right = "TRIP " + (hz < 10.f ? juce::String(hz, 2) : juce::String(hz, 0)) + " Hz   " + right;
     }
+    if (anyMidi) {
+        auto ms = [](float s) { return s < 1.f ? juce::String(juce::roundToInt(s * 1000.f)) + "ms" : juce::String(s, 2) + "s"; };
+        right = (kbd ? TR("KLAVYE  ") : TR("MIDI  ")) + TR("ATAK ") + ms(proc.bank.attackSeconds()) + TR("  SÖNÜM ")
+              + ms(proc.bank.decaySeconds()) + "   " + right;
+    }
+    const float rightW = juce::GlyphArrangement::getStringWidth(CrtLook::mono(13.f), right);
+    g.drawFittedText(left, status.withTrimmedRight(rightW + 16.f).toNearestInt(), juce::Justification::centredLeft, 1, 0.8f);
     g.setColour(ph.withAlpha(0.6f));
     g.drawText(right, status, juce::Justification::centredRight);
 
@@ -416,7 +488,7 @@ void TripPattern::paint(juce::Graphics& g)
 
 // ---------------------------------------------------------------- düğme
 Knob::Knob(SuzgecProcessor& p, const juce::String& id, const juce::String& label, bool bipolar)
-    : attachment(p.apvts, id, slider)
+    : paramId(id), attachment(p.apvts, id, slider)
 {
     slider.setSliderStyle(juce::Slider::RotaryHorizontalVerticalDrag);
     slider.setTextBoxStyle(juce::Slider::TextBoxBelow, false, 84, 18);
@@ -428,6 +500,7 @@ Knob::Knob(SuzgecProcessor& p, const juce::String& id, const juce::String& label
     caption.setText(label, juce::dontSendNotification);
     caption.setJustificationType(juce::Justification::centred);
     caption.setFont(CrtLook::mono(12.f));
+    caption.setInterceptsMouseClicks(false, false);
     addAndMakeVisible(slider);
     addAndMakeVisible(caption);
 }
@@ -448,11 +521,17 @@ Segmented::Segmented(juce::RangedAudioParameter& prm, const juce::StringArray& l
     caption.setJustificationType(juce::Justification::centredLeft);
     addAndMakeVisible(caption);
     for (int i = 0; i < labels.size(); ++i) {
-        auto* b = buttons.add(new juce::TextButton(labels[i]));
+        auto* b = buttons.add(new RClickButton());
+        b->setButtonText(labels[i]);
         b->onClick = [this, i] { attachment.setValueAsCompleteGesture((float) i); };
         addAndMakeVisible(b);
     }
     attachment.sendInitialUpdate();
+}
+
+void Segmented::setRightClick(std::function<void()> fn)
+{
+    for (auto* b : buttons) b->onRightClick = fn;
 }
 
 void Segmented::update(int index)
@@ -471,27 +550,57 @@ void Segmented::resized()
 
 // ---------------------------------------------------------------- içerik
 Content::Content(SuzgecProcessor& p, CrtLook& l)
-    : proc(p), look(l), display(p, l), input(p, "input", TR("GİRİŞ")), output(p, "output", TR("ÇIKIŞ")),
+    : proc(p), look(l), display(p, l), keyboard(p.keyboardState, juce::MidiKeyboardComponent::horizontalKeyboard),
+      ringAtt(p.apvts, "ringOn", ringBtn), downsampleAtt(p.apvts, "downsample", downsampleBtn),
+      kbdAtt(p.apvts, "kbdMode", kbdBtn), input(p, "input", TR("GİRİŞ")), output(p, "output", TR("ÇIKIŞ")),
       mix(p, "mix", TR("KARIŞIM")), resonance(p, "resonance", TR("REZONANS")),
       panEven(p, "panEven", TR("ÇİFT"), true), panOdd(p, "panOdd", TR("TEK"), true),
       softClipAtt(p.apvts, "softclip", softClipBtn),
-      ringAtt(p.apvts, "ringOn", ringBtn), downsampleAtt(p.apvts, "downsample", downsampleBtn),
       shift(*p.apvts.getParameter("shift"), { "-1 ST", "KAPALI", "+1 ST" }, TR("KAYDIR")),
       slope(*p.apvts.getParameter("slope"), { "12 dB", "24 dB" }, TR("EĞİM")),
       tripOnAtt(p.apvts, "tripOn", tripOnBtn), tripSyncAtt(p.apvts, "tripSync", tripSyncBtn),
       tripPhaseAtt(p.apvts, "tripPhase", tripPhaseBtn), tripSpeed(p, "tripSpeed", TR("HIZ")),
       tripDiv(p, "tripDiv", TR("HIZ (SENK)")), tripIntensity(p, "tripIntensity", TR("YOĞUNLUK")),
       tripShape(p, "tripShape", TR("ŞEKİL")), tripToPan(p, "tripToPan", TR("PAN'A")), tripPattern(p, l),
-      syncWatch(*p.apvts.getParameter("tripSync"), [this](float v) {
-          tripSpeed.setVisible(v < 0.5f);
-          tripDiv.setVisible(v >= 0.5f);
+      syncWatch(*p.apvts.getParameter("tripSync"),
+                [this](float v) {
+                    tripSpeed.setVisible(v < 0.5f);
+                    tripDiv.setVisible(v >= 0.5f);
+                }),
+      kbdWatch(*p.apvts.getParameter("kbdMode"), [this](float v) {
+          const bool on = v >= 0.5f;
+          keyboard.setVisible(on);
+          shift.setEnabled(!on); // klavye modunda Kaydır devre dışı
+          shift.setAlpha(on ? 0.4f : 1.f);
+          if (on && display.analysisState() != BandDisplay::Analysis::Off) display.stopAnalysis();
+          layoutDisplay();
       })
 {
     addAndMakeVisible(display);
+    display.onRightClick = [this] {
+        juce::StringArray ids;
+        for (int b = 0; b < sz::kNumBands; ++b) ids.add(SuzgecProcessor::bandParamId(b));
+        showLockMenu(ids, TR("48 bant seviyesi"));
+    };
 
+    keyboard.setAvailableRange(21, 117); // A0 .. A8
+    keyboard.setLowestVisibleKey(21);
+    keyboard.setWantsKeyboardFocus(false);
+    keyboard.setScrollButtonsVisible(false);
+    keyboard.setOctaveForMiddleC(4);
+    addChildComponent(keyboard);
+
+    // --- araç satırı
     flipBtn.setButtonText(TR("TERS ÇEVİR"));
-    flipBtn.setTooltip(TR("Bütün bant seviyelerini ters çevir (%90 -> %10)"));
-    flipBtn.onClick = [this] { proc.flipBands(); };
+    flipBtn.setTooltip(TR("Bütün bant seviyelerini ters çevir (%90 -> %10). Analiz sırasında: gösterilenin tersini uygula."));
+    flipBtn.onClick = [this] {
+        if (display.analysisState() == BandDisplay::Analysis::Ready) {
+            display.applyAnalysis(true);
+            return;
+        }
+        display.stopAnalysis();
+        proc.flipBands();
+    };
     addAndMakeVisible(flipBtn);
 
     ringBtn.setButtonText("RING MOD");
@@ -508,6 +617,36 @@ Content::Content(SuzgecProcessor& p, CrtLook& l)
     downsampleBtn.setTooltip(TR("İşlenmiş sesi host örnekleme hızının dörtte birine düşürür"));
     addAndMakeVisible(downsampleBtn);
 
+    analyzeBtn.setTooltip(TR("Gelen sesin spektrumunu oku, sonra UYGULA ile bant seviyelerine yaz"));
+    analyzeBtn.onClick = [this] {
+        switch (display.analysisState()) {
+        case BandDisplay::Analysis::Off: display.startAnalysis(); break;
+        case BandDisplay::Analysis::Waiting: display.stopAnalysis(); break;
+        case BandDisplay::Analysis::Ready: display.applyAnalysis(false); break;
+        }
+        timerCallback();
+    };
+    addAndMakeVisible(analyzeBtn);
+
+    kbdBtn.setButtonText(TR("KLAVYE"));
+    kbdBtn.setClickingTogglesState(true);
+    kbdBtn.setTooltip(TR("Klavye modu: MIDI notaları en yakın bandı tam nota frekansına akort eder"));
+    addAndMakeVisible(kbdBtn);
+
+    // --- preset çubuğu
+    prevBtn.setButtonText("<");
+    nextBtn.setButtonText(">");
+    prevBtn.onClick = [this] { proc.presets.step(-1); timerCallback(); };
+    nextBtn.onClick = [this] { proc.presets.step(1); timerCallback(); };
+    presetBtn.onClick = [this] { showPresetMenu(); };
+    saveBtn.setButtonText(TR("KAYDET"));
+    saveBtn.onClick = [this] { savePresetDialog(); };
+    diceBtn.setButtonText(TR("ZAR"));
+    diceBtn.setTooltip(TR("Rastgele ses (kilitli parametreler değişmez)"));
+    diceBtn.onClick = [this] { proc.presets.randomize(); timerCallback(); };
+    for (auto* b : { &prevBtn, &presetBtn, &nextBtn, &saveBtn, &diceBtn }) addAndMakeVisible(b);
+
+    // --- trip
     tripOnBtn.setButtonText(TR("AÇIK"));
     tripSyncBtn.setButtonText(TR("SENK"));
     tripPhaseBtn.setButtonText(TR("TERS YÖN"));
@@ -518,10 +657,8 @@ Content::Content(SuzgecProcessor& p, CrtLook& l)
     for (juce::Component* c : std::initializer_list<juce::Component*> { &tripSpeed, &tripDiv, &tripIntensity,
                                                                          &tripShape, &tripToPan, &tripPattern })
         addAndMakeVisible(c);
-    syncWatch.sendInitialUpdate();
-    timerCallback();
-    startTimerHz(10);
 
+    // --- başlık
     paletteBtn.onClick = [this] {
         proc.setPalette(proc.getPalette() + 1);
         applyPalette();
@@ -554,24 +691,155 @@ Content::Content(SuzgecProcessor& p, CrtLook& l)
                                                                          &panOdd, &shift, &slope })
         addAndMakeVisible(c);
 
+    // --- parametre kilidi (sağ tık)
+    for (auto* k : { &input, &output, &mix, &resonance, &panEven, &panOdd, &tripSpeed, &tripDiv, &tripIntensity,
+                     &tripShape, &tripToPan }) {
+        k->slider.onRightClick = [this, k] { showLockMenu({ k->paramId }, k->paramId, k); };
+        registerLockable(*k, { k->paramId });
+    }
+    const std::pair<RClickButton*, const char*> toggles[] = {
+        { &softClipBtn, "softclip" }, { &ringBtn, "ringOn" },     { &downsampleBtn, "downsample" },
+        { &kbdBtn, "kbdMode" },       { &tripOnBtn, "tripOn" },   { &tripSyncBtn, "tripSync" },
+        { &tripPhaseBtn, "tripPhase" },
+    };
+    for (auto [b, id] : toggles) {
+        const juce::String pid(id);
+        b->onRightClick = [this, pid] { showLockMenu({ pid }, pid); };
+        registerLockable(*b, { pid });
+    }
+    shift.setRightClick([this] { showLockMenu({ "shift" }, "shift"); });
+    slope.setRightClick([this] { showLockMenu({ "slope" }, "slope"); });
+    registerLockable(shift, { "shift" });
+    registerLockable(slope, { "slope" });
+
     display.crt = proc.getCrt();
+    syncWatch.sendInitialUpdate();
     setSize(SuzgecEditor::kBaseW, SuzgecEditor::kBaseH);
+    kbdWatch.sendInitialUpdate();
     applyPalette();
+    timerCallback();
+    startTimerHz(10);
 }
+
+void Content::registerLockable(juce::Component& c, const juce::StringArray& ids) { lockables.push_back({ &c, ids }); }
 
 void Content::timerCallback()
 {
     const auto t = proc.getRingMask() != 0 ? TR("TEMİZLE") : TR("RASTGELE");
     if (ringRandomBtn.getButtonText() != t) ringRandomBtn.setButtonText(t);
+
+    juce::String a;
+    switch (display.analysisState()) {
+    case BandDisplay::Analysis::Off: a = TR("ANALİZ"); break;
+    case BandDisplay::Analysis::Waiting: a = TR("ANALİZ…"); break;
+    case BandDisplay::Analysis::Ready: a = TR("UYGULA"); break;
+    }
+    if (analyzeBtn.getButtonText() != a) analyzeBtn.setButtonText(a);
+    analyzeBtn.setToggleState(display.analysisState() != BandDisplay::Analysis::Off, juce::dontSendNotification);
+
+    const auto name = proc.presets.currentName();
+    if (presetBtn.getButtonText() != name) presetBtn.setButtonText(name);
 }
 
 void Content::applyPalette()
 {
     const auto& pe = paletteAt(proc.getPalette());
-    look.setPhosphor(juce::Colour(pe.argb));
+    look.setPhosphor(juce::Colour(pe.argb), proc.getBrightness(), proc.getContrast());
     paletteBtn.setButtonText(TR(pe.name));
+
+    const auto ph = look.phosphor(), bg = look.background();
+    keyboard.setColour(juce::MidiKeyboardComponent::whiteNoteColourId, bg.interpolatedWith(ph, 0.12f));
+    keyboard.setColour(juce::MidiKeyboardComponent::blackNoteColourId, bg.darker(0.5f));
+    keyboard.setColour(juce::MidiKeyboardComponent::keySeparatorLineColourId, ph.withAlpha(0.35f));
+    keyboard.setColour(juce::MidiKeyboardComponent::mouseOverKeyOverlayColourId, ph.withAlpha(0.25f));
+    keyboard.setColour(juce::MidiKeyboardComponent::keyDownOverlayColourId, ph.withAlpha(0.85f));
+    keyboard.setColour(juce::MidiKeyboardComponent::shadowColourId, juce::Colours::transparentBlack);
+    keyboard.setColour(juce::MidiKeyboardComponent::textLabelColourId, ph.withAlpha(0.7f));
+
     sendLookAndFeelChange();
     repaint();
+}
+
+void Content::showLockMenu(const juce::StringArray& ids, const juce::String& title, Knob* knob)
+{
+    bool all = true;
+    for (auto& id : ids) all &= proc.isLocked(id);
+    juce::String name = title;
+    if (ids.size() == 1)
+        if (auto* prm = proc.apvts.getParameter(ids[0])) name = prm->getName(40);
+
+    juce::PopupMenu m;
+    m.addSectionHeader(name);
+    m.addItem(all ? TR("Kilidi aç") : TR("Kilitle"), [this, ids, all] {
+        proc.setLockedMany(ids, !all);
+        repaint();
+    });
+    if (knob != nullptr) m.addItem(TR("Değer gir…  (Shift+tık)"), [knob] { knob->slider.showTextBox(); });
+    m.addSeparator();
+    m.addItem(TR("Hepsini kilitle"), [this] {
+        proc.lockAll(true);
+        repaint();
+    });
+    m.addItem(TR("Bütün kilitleri aç"), [this] {
+        proc.lockAll(false);
+        repaint();
+    });
+    m.showMenuAsync(juce::PopupMenu::Options());
+}
+
+void Content::showPresetMenu()
+{
+    juce::PopupMenu m;
+    const auto current = proc.presets.currentName();
+    m.addSectionHeader(TR("FABRİKA"));
+    for (auto& e : proc.presets.allEntries()) {
+        if (!e.factory) continue;
+        const int fi = e.factoryIndex;
+        m.addItem(e.name, true, e.name == current, [this, fi] {
+            proc.presets.loadFactory(fi);
+            timerCallback();
+        });
+    }
+    bool anyUser = false;
+    for (auto& e : proc.presets.allEntries()) {
+        if (e.factory) continue;
+        if (!anyUser) {
+            m.addSeparator();
+            m.addSectionHeader(TR("KULLANICI"));
+            anyUser = true;
+        }
+        const auto f = e.file;
+        m.addItem(e.name, true, e.name == current, [this, f] {
+            proc.presets.loadFile(f);
+            timerCallback();
+        });
+    }
+    m.addSeparator();
+    m.addItem(TR("Kaydet…"), [this] { savePresetDialog(); });
+    m.addItem(TR("Preset klasörünü aç"), [] {
+        auto dir = PresetManager::userFolder();
+        dir.createDirectory();
+        dir.revealToUser();
+    });
+    m.showMenuAsync(juce::PopupMenu::Options().withTargetComponent(&presetBtn));
+}
+
+void Content::savePresetDialog()
+{
+    auto* w = new juce::AlertWindow(TR("Preset kaydet"), TR("Preset adı:"), juce::MessageBoxIconType::NoIcon, this);
+    w->addTextEditor("name", proc.presets.currentName());
+    w->addButton(TR("KAYDET"), 1, juce::KeyPress(juce::KeyPress::returnKey));
+    w->addButton(TR("VAZGEÇ"), 0, juce::KeyPress(juce::KeyPress::escapeKey));
+    juce::Component::SafePointer<Content> safe(this);
+    w->enterModalState(true, juce::ModalCallbackFunction::create([safe, w](int result) {
+                           if (result != 1 || safe == nullptr) return;
+                           const auto name = w->getTextEditorContents("name");
+                           if (!safe->proc.presets.save(name))
+                               juce::AlertWindow::showMessageBoxAsync(juce::MessageBoxIconType::WarningIcon,
+                                                                      TR("Süzgeç"), TR("Preset kaydedilemedi."));
+                           safe->timerCallback();
+                       }),
+                       true);
 }
 
 void Content::showMenu()
@@ -582,14 +850,33 @@ void Content::showMenu()
     sizes.addItem(TR("Standart"), true, w == 960, [this] { if (onSizeChosen) onSizeChosen(960); });
     sizes.addItem(TR("Büyük"), true, w == 1280, [this] { if (onSizeChosen) onSizeChosen(1280); });
 
+    juce::PopupMenu os;
+    const char* osNames[] = { "Kapalı", "2x", "4x", "8x", "16x" };
+    for (int i = 0; i < 5; ++i)
+        os.addItem(TR(osNames[i]), true, proc.getOversampling() == i, [this, i] { proc.setOversampling(i); });
+
+    auto stepMenu = [this](float current, std::function<void(float)> set) {
+        juce::PopupMenu sm;
+        for (float v : { 0.7f, 0.85f, 1.f, 1.15f, 1.3f })
+            sm.addItem("%" + juce::String(juce::roundToInt(v * 100.f)), true, std::abs(current - v) < 0.01f, [this, v, set] {
+                set(v);
+                applyPalette();
+            });
+        return sm;
+    };
+
     juce::PopupMenu m;
+    m.addSubMenu(TR("Oversampling"), os);
     m.addSubMenu(TR("Pencere boyutu"), sizes);
+    m.addSubMenu(TR("Parlaklık"), stepMenu(proc.getBrightness(), [this](float v) { proc.setBrightness(v); }));
+    m.addSubMenu(TR("Kontrast"), stepMenu(proc.getContrast(), [this](float v) { proc.setContrast(v); }));
     m.addSeparator();
     m.addItem(TR("Preseti panoya kopyala"), [this] { juce::SystemClipboard::copyTextToClipboard(proc.presetToString()); });
     m.addItem(TR("Panodan preset yapıştır"), [this] {
         if (!proc.presetFromString(juce::SystemClipboard::getTextFromClipboard()))
             juce::AlertWindow::showMessageBoxAsync(juce::MessageBoxIconType::WarningIcon, TR("Süzgeç"),
                                                    TR("Panoda geçerli bir Süzgeç preseti yok."));
+        timerCallback();
     });
     m.addSeparator();
     m.addItem(TR("Bütün bantları %75'e sıfırla"), [this] {
@@ -600,7 +887,23 @@ void Content::showMenu()
             prm->endChangeGesture();
         }
     });
+    m.addItem(TR("Bütün kilitleri aç"), [this] {
+        proc.lockAll(false);
+        repaint();
+    });
     m.showMenuAsync(juce::PopupMenu::Options().withTargetComponent(&menuBtn));
+}
+
+void Content::layoutDisplay()
+{
+    const int W = getWidth();
+    if (keyboard.isVisible()) {
+        display.setBounds(20, 92, W - 40, 222);
+        keyboard.setBounds(20, 318, W - 40, 54);
+        keyboard.setKeyWidth((float) (W - 40) / 50.f); // A0..A8: 50 beyaz tuş
+    } else {
+        display.setBounds(20, 92, W - 40, 280);
+    }
 }
 
 void Content::resized()
@@ -610,13 +913,20 @@ void Content::resized()
     menuBtn.setBounds(W - 20 - 64, 12, 64, 28);
     crtBtn.setBounds(menuBtn.getX() - 8 - 60, 12, 60, 28);
     paletteBtn.setBounds(crtBtn.getX() - 8 - 110, 12, 110, 28);
+    prevBtn.setBounds(150, 12, 30, 28);
+    presetBtn.setBounds(184, 12, 236, 28);
+    nextBtn.setBounds(424, 12, 30, 28);
+    saveBtn.setBounds(462, 12, 84, 28);
+    diceBtn.setBounds(552, 12, 60, 28);
 
     // araç satırı + ekran
     flipBtn.setBounds(20, 56, 130, 28);
     ringBtn.setBounds(166, 56, 110, 28);
     ringRandomBtn.setBounds(282, 56, 100, 28);
     downsampleBtn.setBounds(398, 56, 140, 28);
-    display.setBounds(20, 92, W - 40, 280);
+    analyzeBtn.setBounds(W - 20 - 110 - 8 - 120, 56, 120, 28);
+    kbdBtn.setBounds(W - 20 - 110, 56, 110, 28);
+    layoutDisplay();
 
     // alt paneller
     const int top = 388, h = 150;
@@ -645,10 +955,10 @@ void Content::resized()
     panEven.setBounds(pr);
 
     auto tr = knobRow(tripPanel).reduced(12, 0);
-    auto toggles = tr.removeFromLeft(120);
-    tripOnBtn.setBounds(toggles.removeFromTop(32).reduced(0, 2));
-    tripSyncBtn.setBounds(toggles.removeFromTop(38).reduced(0, 5));
-    tripPhaseBtn.setBounds(toggles.removeFromTop(32).reduced(0, 2));
+    auto toggleCol = tr.removeFromLeft(120);
+    tripOnBtn.setBounds(toggleCol.removeFromTop(32).reduced(0, 2));
+    tripSyncBtn.setBounds(toggleCol.removeFromTop(38).reduced(0, 5));
+    tripPhaseBtn.setBounds(toggleCol.removeFromTop(32).reduced(0, 2));
     tr.removeFromLeft(12);
     const auto speedArea = tr.removeFromLeft(100);
     tripSpeed.setBounds(speedArea);
@@ -671,11 +981,6 @@ void Content::paint(juce::Graphics& g)
     g.setColour(ph);
     g.setFont(CrtLook::mono(26.f));
     g.drawText(TR("SÜZGEÇ"), 20, 10, 200, 32, juce::Justification::centredLeft);
-    g.setColour(ph.withAlpha(0.6f));
-    g.setFont(CrtLook::mono(12.f, false));
-    g.drawText(TR("48 BANT  ·  9:8 SPEKTRAL FİLTRE"), 150, 18, 320, 20, juce::Justification::centredLeft);
-    g.drawText(TR("55 Hz – 13.9 kHz  ·  tam ses aralık"), 560, 60, getWidth() - 580, 20,
-               juce::Justification::centredRight);
 
     auto drawPanel = [&](juce::Rectangle<int> r, const juce::String& title) {
         const auto rf = r.toFloat();
@@ -713,6 +1018,33 @@ void Content::buildOverlay()
 
 void Content::paintOverChildren(juce::Graphics& g)
 {
+    // kilit simgeleri
+    const auto ph = look.phosphor();
+    auto padlock = [&](float x, float y) {
+        g.setColour(look.background());
+        g.fillRoundedRectangle(x - 2.f, y - 2.f, 14.f, 15.f, 3.f);
+        g.setColour(ph);
+        juce::Path shackle;
+        shackle.addCentredArc(x + 5.f, y + 5.f, 3.2f, 3.5f, 0.f, -juce::MathConstants<float>::halfPi,
+                              juce::MathConstants<float>::halfPi, true);
+        g.strokePath(shackle, juce::PathStrokeType(1.5f));
+        g.fillRoundedRectangle(x + 0.5f, y + 5.f, 9.f, 6.5f, 1.5f);
+    };
+    for (auto& [comp, ids] : lockables) {
+        if (!comp->isVisible()) continue;
+        bool all = true;
+        for (auto& id : ids) all &= proc.isLocked(id);
+        if (!all) continue;
+        const auto b = comp->getBounds().toFloat();
+        padlock(b.getRight() - 14.f, b.getY() + 1.f);
+    }
+    int bandLocks = 0;
+    for (int b = 0; b < sz::kNumBands; ++b) bandLocks += proc.isLocked(SuzgecProcessor::bandParamId(b)) ? 1 : 0;
+    if (bandLocks > 0) {
+        const auto d = display.getBounds().toFloat();
+        padlock(d.getRight() - 22.f, d.getY() + 6.f);
+    }
+
     if (!proc.getCrt() || !overlay.isValid()) return;
     g.drawImage(overlay, getLocalBounds().toFloat());
 }

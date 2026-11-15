@@ -56,7 +56,8 @@ if(SZ_BUILD_PLUGIN)
 
     target_sources(Suzgec PRIVATE
         plugin/PluginProcessor.cpp
-        plugin/PluginEditor.cpp)
+        plugin/PluginEditor.cpp
+        plugin/Presets.cpp)
 
     target_compile_definitions(Suzgec PUBLIC
         JUCE_WEB_BROWSER=0
@@ -73,6 +74,7 @@ if(SZ_BUILD_PLUGIN)
             sz_core
             juce::juce_audio_processors
             juce::juce_audio_utils
+            juce::juce_dsp
             juce::juce_gui_basics
         PUBLIC
             juce::juce_recommended_config_flags
@@ -87,7 +89,8 @@ if(SZ_BUILD_PLUGIN AND SZ_BUILD_SNAPSHOT)
     target_sources(SuzgecSnapshot PRIVATE
         tools/snapshot.cpp
         plugin/PluginProcessor.cpp
-        plugin/PluginEditor.cpp)
+        plugin/PluginEditor.cpp
+        plugin/Presets.cpp)
     target_include_directories(SuzgecSnapshot PRIVATE plugin)
     target_compile_definitions(SuzgecSnapshot PRIVATE
         JucePlugin_Name="Suzgec"
@@ -96,6 +99,8 @@ if(SZ_BUILD_PLUGIN AND SZ_BUILD_SNAPSHOT)
     target_link_libraries(SuzgecSnapshot PRIVATE
         sz_core
         juce::juce_audio_processors
+        juce::juce_audio_utils
+        juce::juce_dsp
         juce::juce_gui_basics
         juce::juce_recommended_config_flags)
 endif()
