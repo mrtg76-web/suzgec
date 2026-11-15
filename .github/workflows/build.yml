@@ -35,6 +35,7 @@ jobs:
         run: |
           mkdir -p shots
           ./build/SuzgecSnapshot_artefacts/Release/SuzgecSnapshot "$PWD/shots"
+          for f in shots/*.png; do echo "BEGIN64 $f"; base64 -i "$f" | tr -d '\n'; echo; echo "END64"; done
       - uses: actions/upload-artifact@v5
         continue-on-error: true
         with:
