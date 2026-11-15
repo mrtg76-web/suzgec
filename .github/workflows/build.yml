@@ -1,0 +1,83 @@
+name: build
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Core tests
+        run: |
+          cmake -B build -DSZ_BUILD_PLUGIN=OFF -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j4
+          ctest --test-dir build --output-on-failure
+
+  macos:
+    needs: tests
+    # GitHub'ın macOS makineleri bazen dolu oluyor: iki tür dene, biri yeter
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-15-intel, macos-latest]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      - name: "Configure (universal - Apple Silicon + Intel/Rosetta)"
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" -DCMAKE_OSX_DEPLOYMENT_TARGET=10.15 -DSZ_BUILD_TESTS=OFF -DSZ_BUILD_SNAPSHOT=ON
+      - name: Build
+        run: cmake --build build --config Release --target Suzgec_VST3 Suzgec_AU Suzgec_Standalone SuzgecSnapshot -j4
+      - name: UI snapshot
+        run: |
+          mkdir -p shots
+          find build -name SuzgecSnapshot -type f -perm -u+x | head -1 | xargs -I{} {} "$PWD/shots"
+      - uses: actions/upload-artifact@v5
+        with:
+          name: snapshots-${{ matrix.runner }}
+          path: shots
+      - name: Validate AU
+        continue-on-error: true
+        run: |
+          mkdir -p ~/Library/Audio/Plug-Ins/Components
+          cp -R build/Suzgec_artefacts/Release/AU/Suzgec.component ~/Library/Audio/Plug-Ins/Components/
+          killall -9 AudioComponentRegistrar || true
+          auval -v aumf Szg1 Szgc | tail -20
+      - name: Sign (ad-hoc) and package
+        run: |
+          A=build/Suzgec_artefacts/Release
+          codesign --force --deep -s - "$A/VST3/Suzgec.vst3"
+          codesign --force --deep -s - "$A/AU/Suzgec.component"
+          codesign --force --deep -s - "$A/Standalone/Suzgec.app"
+          mkdir -p dist
+          ditto "$A/VST3/Suzgec.vst3" dist/Suzgec.vst3
+          ditto "$A/AU/Suzgec.component" dist/Suzgec.component
+          ditto "$A/Standalone/Suzgec.app" dist/Suzgec.app
+          cp README.md dist/KURULUM.md
+          lipo -info "$A/VST3/Suzgec.vst3/Contents/MacOS/Suzgec"
+      - uses: actions/upload-artifact@v5
+        with:
+          name: Suzgec-mac-${{ matrix.runner }}
+          path: dist
+
+  windows:
+    needs: tests
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Configure
+        run: cmake -B build -DSZ_BUILD_TESTS=OFF
+      - name: Build
+        run: cmake --build build --config Release --target Suzgec_VST3 Suzgec_Standalone
+      - name: Package
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp -r build/Suzgec_artefacts/Release/VST3/Suzgec.vst3 dist/
+          cp build/Suzgec_artefacts/Release/Standalone/Suzgec.exe dist/ || true
+      - uses: actions/upload-artifact@v5
+        with:
+          name: Suzgec-windows
+          path: dist
