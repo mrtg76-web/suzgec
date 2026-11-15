@@ -2,7 +2,7 @@
 #include "PluginEditor.h"
 
 namespace {
-const juce::Identifier kPalette("palette"), kCrt("crt"), kUiWidth("uiWidth");
+const juce::Identifier kPalette("palette"), kCrt("crt"), kUiWidth("uiWidth"), kRingMask("ringMask");
 constexpr const char* kPresetPrefix = "SUZGEC1:";
 
 juce::String dbText(float v, int)
@@ -11,6 +11,13 @@ juce::String dbText(float v, int)
     return (v > 0.f ? "+" : "") + juce::String(v, 1) + " dB";
 }
 juce::String pctText(float v, int) { return juce::String(juce::roundToInt(v)) + "%"; }
+juce::String hzText(float v, int)
+{
+    if (v >= 1000.f) return juce::String(v / 1000.f, 2) + " kHz";
+    if (v >= 100.f) return juce::String(v, 0) + " Hz";
+    if (v >= 10.f) return juce::String(v, 1) + " Hz";
+    return juce::String(v, 2) + " Hz";
+}
 juce::String panText(float v, int)
 {
     const int i = juce::roundToInt(v);
@@ -54,6 +61,31 @@ juce::AudioProcessorValueTreeState::ParameterLayout SuzgecProcessor::createLayou
             ParameterID { bandParamId(b), 1 }, name, NormalisableRange<float>(0.f, 100.f, 0.01f), 75.f,
             AudioParameterFloatAttributes().withLabel("%").withStringFromValueFunction(pctText)));
     }
+
+    // --- Faz 2: Trip, Ring Mod, Downsample
+    layout.add(std::make_unique<AudioParameterBool>(ParameterID { "tripOn", 1 }, "Trip On", false));
+    {
+        constexpr float lo = 0.01f, hi = 2000.f;
+        NormalisableRange<float> logRange(
+            lo, hi, [](float a, float b, float t) { return a * std::pow(b / a, t); },
+            [](float a, float b, float v) { return std::log(v / a) / std::log(b / a); });
+        layout.add(std::make_unique<AudioParameterFloat>(
+            ParameterID { "tripSpeed", 1 }, "Trip Speed", logRange, 0.5f,
+            AudioParameterFloatAttributes().withLabel("Hz").withStringFromValueFunction(hzText)));
+    }
+    layout.add(std::make_unique<AudioParameterBool>(ParameterID { "tripSync", 1 }, "Trip Sync", false));
+    {
+        StringArray names;
+        for (const auto& d : sz::syncDivisions()) names.add(String(CharPointer_UTF8(d.name.c_str())));
+        layout.add(std::make_unique<AudioParameterChoice>(ParameterID { "tripDiv", 1 }, "Trip Division", names,
+                                                          sz::defaultSyncDivision()));
+    }
+    fl("tripIntensity", "Trip Intensity", 0.f, 100.f, 50.f, pctText, "%");
+    fl("tripShape", "Trip Shape", 0.f, 100.f, 0.f, pctText, "%");
+    layout.add(std::make_unique<AudioParameterBool>(ParameterID { "tripPhase", 1 }, "Trip Phase (Reverse)", false));
+    fl("tripToPan", "Trip To Pan", 0.f, 100.f, 0.f, pctText, "%");
+    layout.add(std::make_unique<AudioParameterBool>(ParameterID { "ringOn", 1 }, "Ring Mod", false));
+    layout.add(std::make_unique<AudioParameterBool>(ParameterID { "downsample", 1 }, "Downsample", false));
     return layout;
 }
 
@@ -72,6 +104,16 @@ SuzgecProcessor::SuzgecProcessor()
     pResonance = apvts.getRawParameterValue("resonance");
     pPanEven = apvts.getRawParameterValue("panEven");
     pPanOdd = apvts.getRawParameterValue("panOdd");
+    pTripOn = apvts.getRawParameterValue("tripOn");
+    pTripSpeed = apvts.getRawParameterValue("tripSpeed");
+    pTripSync = apvts.getRawParameterValue("tripSync");
+    pTripDiv = apvts.getRawParameterValue("tripDiv");
+    pTripIntensity = apvts.getRawParameterValue("tripIntensity");
+    pTripShape = apvts.getRawParameterValue("tripShape");
+    pTripPhase = apvts.getRawParameterValue("tripPhase");
+    pTripToPan = apvts.getRawParameterValue("tripToPan");
+    pRingOn = apvts.getRawParameterValue("ringOn");
+    pDownsample = apvts.getRawParameterValue("downsample");
     for (int b = 0; b < sz::kNumBands; ++b) {
         pBands[(size_t) b] = apvts.getRawParameterValue(bandParamId(b));
         bandParams[(size_t) b] = apvts.getParameter(bandParamId(b));
@@ -101,6 +143,16 @@ sz::Params SuzgecProcessor::readParams() const
     p.panEven = pPanEven->load() * 0.01f;
     p.panOdd = pPanOdd->load() * 0.01f;
     for (int b = 0; b < sz::kNumBands; ++b) p.level[(size_t) b] = pBands[(size_t) b]->load() * 0.01f;
+
+    p.tripOn = pTripOn->load() > 0.5f;
+    p.tripRateHz = pTripSpeed->load();
+    p.tripIntensity = pTripIntensity->load() * 0.01f;
+    p.tripShape = pTripShape->load() * 0.01f;
+    p.tripReverse = pTripPhase->load() > 0.5f;
+    p.tripToPan = pTripToPan->load() * 0.01f;
+    p.ringOn = pRingOn->load() > 0.5f;
+    p.ringMask = ringMask.load();
+    p.downsample = pDownsample->load() > 0.5f;
     return p;
 }
 
@@ -118,7 +170,27 @@ void SuzgecProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::MidiB
     const int numIn = getTotalNumInputChannels();
     for (int ch = numIn; ch < getTotalNumOutputChannels(); ++ch) buffer.clear(ch, 0, buffer.getNumSamples());
 
-    bank.setParams(readParams());
+    auto p = readParams();
+
+    // Trip senkronu: host temposuna ve çalma konumuna kilitlen
+    if (p.tripOn && pTripSync->load() > 0.5f) {
+        const auto& divs = sz::syncDivisions();
+        const int di = juce::jlimit(0, (int) divs.size() - 1, juce::roundToInt(pTripDiv->load()));
+        const double beats = divs[(size_t) di].beats;
+        double bpm = 120.0;
+        if (auto* ph = getPlayHead())
+            if (auto pos = ph->getPosition()) {
+                if (auto b = pos->getBpm()) bpm = *b;
+                if (pos->getIsPlaying())
+                    if (auto ppq = pos->getPpqPosition()) {
+                        p.tripLocked = true;
+                        p.tripPosition = (*ppq / beats) * (p.tripReverse ? -1.0 : 1.0);
+                    }
+            }
+        p.tripRateHz = bpm / 60.0 / beats;
+    }
+    tripRateShown.store((float) p.tripRateHz, std::memory_order_relaxed);
+    bank.setParams(p);
 
     if (buffer.getNumChannels() == 0) return;
     float* l = buffer.getWritePointer(0);
@@ -144,6 +216,43 @@ void SuzgecProcessor::flipBands()
     }
 }
 
+// ---------------------------------------------------------------- Ring Mod seçimi
+void SuzgecProcessor::setRingMask(std::uint64_t mask)
+{
+    mask &= (1ull << sz::kNumBands) - 1;
+    ringMask.store(mask);
+    apvts.state.setProperty(kRingMask, juce::String::toHexString((juce::int64) mask), nullptr);
+}
+
+void SuzgecProcessor::toggleRingBand(int band)
+{
+    setRingMask(ringMask.load() ^ (1ull << band));
+}
+
+void SuzgecProcessor::randomOrClearRing()
+{
+    if (ringMask.load() != 0) {
+        setRingMask(0);
+        return;
+    }
+    auto& rnd = juce::Random::getSystemRandom();
+    const int count = 3 + rnd.nextInt(3); // 3..5 bant
+    std::uint64_t m = 0;
+    for (int picked = 0; picked < count;) {
+        const auto bit = 1ull << rnd.nextInt(sz::kNumBands);
+        if (m & bit) continue;
+        m |= bit;
+        ++picked;
+    }
+    setRingMask(m);
+}
+
+void SuzgecProcessor::loadRingMaskFromState()
+{
+    const auto hex = apvts.state.getProperty(kRingMask, "0").toString();
+    ringMask.store((std::uint64_t) hex.getHexValue64() & ((1ull << sz::kNumBands) - 1));
+}
+
 // ---------------------------------------------------------------- arayüz ayarları
 int SuzgecProcessor::getPalette() const { return (int) apvts.state.getProperty(kPalette, 0); }
 void SuzgecProcessor::setPalette(int i) { apvts.state.setProperty(kPalette, i, nullptr); }
@@ -162,7 +271,10 @@ void SuzgecProcessor::getStateInformation(juce::MemoryBlock& destData)
 void SuzgecProcessor::setStateInformation(const void* data, int sizeInBytes)
 {
     if (auto xml = getXmlFromBinary(data, sizeInBytes))
-        if (xml->hasTagName(apvts.state.getType())) apvts.replaceState(juce::ValueTree::fromXml(*xml));
+        if (xml->hasTagName(apvts.state.getType())) {
+            apvts.replaceState(juce::ValueTree::fromXml(*xml));
+            loadRingMaskFromState();
+        }
 }
 
 juce::String SuzgecProcessor::presetToString()
@@ -196,6 +308,8 @@ bool SuzgecProcessor::presetFromString(const juce::String& text)
             prm->endChangeGesture();
         }
     }
+    const auto hex = tree.getProperty(kRingMask, "0").toString();
+    setRingMask((std::uint64_t) hex.getHexValue64());
     return true;
 }
 

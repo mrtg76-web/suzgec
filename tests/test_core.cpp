@@ -1,6 +1,7 @@
 // Süzgeç çekirdek testleri (JUCE gerektirmez)
 #include "FilterBank.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -173,6 +174,15 @@ static void testStability()
             p.softClip = u(rng) > 0.5f;
             p.panEven = u(rng) * 2 - 1;
             p.panOdd = u(rng) * 2 - 1;
+            p.tripOn = u(rng) > 0.3f;
+            p.tripRateHz = 0.01 * std::pow(200000.0, (double) u(rng));
+            p.tripIntensity = u(rng);
+            p.tripShape = u(rng);
+            p.tripReverse = u(rng) > 0.5f;
+            p.tripToPan = u(rng);
+            p.ringOn = u(rng) > 0.5f;
+            p.ringMask = ((std::uint64_t) rng() << 16) & ((1ull << 48) - 1) & (u(rng) > 0.5f ? 0x0F0F0F0F0F0Full : 0x8001ull);
+            p.downsample = u(rng) > 0.7f;
             fb.setParams(p);
         }
         for (size_t i = 0; i < l.size(); ++i) {
@@ -207,12 +217,169 @@ static void testPerformance()
     fb.prepare(kFs);
     Params p = flat(0.8f);
     p.slope24 = true;
+    p.tripOn = true;
+    p.tripToPan = 0.5f;
+    p.tripShape = 0.7f;
+    p.ringOn = true;
+    p.ringMask = 0xF0F0;
     fb.setParams(p);
     std::vector<float> l(480000, 0.1f), r(480000, 0.1f);
     const auto t0 = std::chrono::steady_clock::now();
     run(fb, l, r, 512);
     const double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     std::printf("10 s stereo 24 dB/oct processed in %.3f s (%.1f%% of one core)\n", sec, sec / 10.0 * 100);
+}
+
+static void testSyncDivisions()
+{
+    const auto& d = syncDivisions();
+    CHECK(d.front().beats == 256.0, "first = 64 bars");
+    CHECK(std::fabs(d.back().beats - 0.0625 * 2.0 / 3.0) < 1e-12, "last = 1/64T");
+    CHECK(d[(size_t) defaultSyncDivision()].beats == 4.0, "default = 1 bar");
+    std::printf("%zu sync divisions, default '%s', first '%s', last '%s'\n", d.size(),
+                d[(size_t) defaultSyncDivision()].name.c_str(), d.front().name.c_str(), d.back().name.c_str());
+}
+
+static void testTripOffsets()
+{
+    // sıralı: artan; tek/çift: 0 / 0.5; karışık: permütasyon (hepsi farklı)
+    CHECK(FilterBank::tripOffset(10, 0.f) > FilterBank::tripOffset(9, 0.f), "sequential");
+    CHECK(FilterBank::tripOffset(3, 0.5f) == 0.5f && FilterBank::tripOffset(4, 0.5f) == 0.f, "alternating");
+    std::vector<float> v;
+    for (int b = 0; b < kNumBands; ++b) v.push_back(FilterBank::tripOffset(b, 1.f));
+    std::sort(v.begin(), v.end());
+    CHECK(std::adjacent_find(v.begin(), v.end()) == v.end(), "shuffle unique");
+}
+
+static std::vector<float> runTrip(Params p, double hz, int n)
+{
+    FilterBank fb;
+    fb.prepare(kFs);
+    fb.setParams(p);
+    fb.reset();
+    auto l = sine(hz, 0.1, n), r = sine(hz, 0.1, n);
+    run(fb, l, r, 128);
+    return l;
+}
+
+static void testTrip()
+{
+    const int band = 20;
+    const double f = bandFrequency(band);
+    Params p = flat(0.f);
+    p.level[(size_t) band] = 1.f;
+
+    auto off = runTrip(p, f, 96000);
+    Params q = p;
+    q.tripOn = true;
+    q.tripIntensity = 0.f;
+    q.tripRateHz = 3.0;
+    auto zero = runTrip(q, f, 96000);
+    double err = 0;
+    for (size_t i = 0; i < off.size(); ++i) err = std::max(err, (double) std::fabs(off[i] - zero[i]));
+    CHECK(err < 1e-5, "intensity 0 == off (err %g)", err);
+
+    // %100 yoğunluk, 2 Hz: 50 ms'lik pencerelerde seviye neredeyse 0 ile tam arasında dalgalanmalı
+    q.tripIntensity = 1.f;
+    q.tripRateHz = 2.0;
+    auto mod = runTrip(q, f, 96000);
+    double lo = 1e9, hi = 0;
+    for (size_t w = 24000; w + 2400 <= mod.size(); w += 1200) {
+        double s = 0;
+        for (size_t i = w; i < w + 2400; ++i) s += (double) mod[i] * mod[i];
+        lo = std::min(lo, std::sqrt(s / 2400));
+        hi = std::max(hi, std::sqrt(s / 2400));
+    }
+    std::printf("trip 100%% @2Hz: window rms %.4f .. %.4f\n", lo, hi);
+    CHECK(hi > 0.03 && lo < hi * 0.15, "trip modulates level");
+
+    // To Pan, yoğunluk 0: sol/sağ dengesi zamanla değişmeli
+    FilterBank fb;
+    fb.prepare(kFs);
+    Params pp = flat(1.f);
+    pp.tripOn = true;
+    pp.tripIntensity = 0.f;
+    pp.tripToPan = 1.f;
+    pp.tripRateHz = 1.0;
+    fb.setParams(pp);
+    fb.reset();
+    auto l = sine(440, 0.1, 48000), r = sine(440, 0.1, 48000);
+    run(fb, l, r, 128);
+    double maxDiff = 0;
+    for (size_t w = 4800; w + 2400 <= l.size(); w += 2400) {
+        double a = 0, b2 = 0;
+        for (size_t i = w; i < w + 2400; ++i) {
+            a += (double) l[i] * l[i];
+            b2 += (double) r[i] * r[i];
+        }
+        maxDiff = std::max(maxDiff, std::fabs(std::sqrt(a) - std::sqrt(b2)) / (std::sqrt(a) + std::sqrt(b2) + 1e-9));
+    }
+    std::printf("to pan: max L/R imbalance %.2f\n", maxDiff);
+    CHECK(maxDiff > 0.3, "to pan moves stereo image");
+
+    // senkron kilit: aynı host konumu -> aynı çıktı
+    Params s1 = p;
+    s1.tripOn = true;
+    s1.tripIntensity = 1.f;
+    s1.tripRateHz = 4.0;
+    s1.tripLocked = true;
+    s1.tripPosition = 0.25;
+    FilterBank a, b;
+    a.prepare(kFs);
+    b.prepare(kFs);
+    a.setParams(s1);
+    b.setParams(s1);
+    auto x1 = sine(f, 0.1, 256), x2 = x1;
+    a.process(x1.data(), nullptr, 256);
+    b.process(x2.data(), nullptr, 256);
+    CHECK(x1 == x2, "locked phase deterministic");
+}
+
+static void testRingMod()
+{
+    // maske boşsa ring mod kapalıyla aynı
+    Params p = flat(0.8f);
+    auto base = runTrip(p, 300, 24000);
+    Params q = p;
+    q.ringOn = true;
+    q.ringMask = 0;
+    auto same = runTrip(q, 300, 24000);
+    CHECK(base == same, "empty mask = unmodulated");
+
+    // seçili bantlar: çıktı değişmeli, sonlu ve makul seviyede kalmalı
+    q.ringMask = (1ull << 5) | (1ull << 17) | (1ull << 30);
+    std::mt19937 rng(5);
+    std::normal_distribution<float> nd(0.f, 0.1f);
+    FilterBank fb;
+    fb.prepare(kFs);
+    fb.setParams(q);
+    fb.reset();
+    std::vector<float> l(48000), r(48000);
+    for (auto& x : l) x = nd(rng);
+    for (auto& x : r) x = nd(rng);
+    const double in = rms(l);
+    run(fb, l, r);
+    bool finite = true;
+    for (float x : l) finite &= std::isfinite(x);
+    const double db = 20 * std::log10(rms(l, 24000) / in);
+    std::printf("ring mod 3 bands on noise: %+.1f dB\n", db);
+    CHECK(finite, "ring finite");
+    CHECK(db > -20 && db < 12, "ring level reasonable");
+}
+
+static void testDownsample()
+{
+    Params p = flat(0.8f);
+    p.downsample = true;
+    FilterBank fb;
+    fb.prepare(kFs);
+    fb.setParams(p);
+    fb.reset();
+    auto l = sine(1000, 0.2, 4800), r = sine(700, 0.2, 4800);
+    run(fb, l, r, 100); // blok sınırları 4'e bölünmüyor: sayaç bloklar arasında sürmeli
+    bool held = true;
+    for (size_t i = 0; i + 3 < l.size(); i += 4) held &= (std::fabs(l[i] - l[i + 1]) < 1e-6f && std::fabs(l[i] - l[i + 3]) < 1e-6f);
+    CHECK(held, "downsample holds 4 samples");
 }
 
 int main()
@@ -224,6 +391,11 @@ int main()
     testPan();
     testStability();
     testMono();
+    testSyncDivisions();
+    testTripOffsets();
+    testTrip();
+    testRingMod();
+    testDownsample();
     testPerformance();
     std::printf(failures ? "\n%d FAILURE(S)\n" : "\nall tests passed\n", failures);
     return failures ? 1 : 0;

@@ -41,6 +41,15 @@ public:
     juce::String presetToString();               // panoya kopyalama
     bool presetFromString(const juce::String&);  // panodan yapıştırma
 
+    // Ring Mod bant seçimi (mesaj iş parçacığı)
+    std::uint64_t getRingMask() const { return ringMask.load(); }
+    void setRingMask(std::uint64_t mask);
+    void toggleRingBand(int band);
+    void randomOrClearRing(); // seçim yoksa rastgele 3-5 bant, varsa temizle
+
+    // Trip'in o anki hızı (senkronda tempodan hesaplanan), Hz
+    float getTripRateHz() const { return tripRateShown.load(std::memory_order_relaxed); }
+
     // Arayüz ayarları (projeyle birlikte saklanır, ses etkilemez)
     int getPalette() const;
     void setPalette(int index);
@@ -55,6 +64,20 @@ public:
 private:
     static juce::AudioProcessorValueTreeState::ParameterLayout createLayout();
     sz::Params readParams() const;
+    void loadRingMaskFromState();
+
+    std::atomic<std::uint64_t> ringMask { 0 };
+    std::atomic<float> tripRateShown { 0.5f };
+    std::atomic<float>* pTripOn = nullptr;
+    std::atomic<float>* pTripSpeed = nullptr;
+    std::atomic<float>* pTripSync = nullptr;
+    std::atomic<float>* pTripDiv = nullptr;
+    std::atomic<float>* pTripIntensity = nullptr;
+    std::atomic<float>* pTripShape = nullptr;
+    std::atomic<float>* pTripPhase = nullptr;
+    std::atomic<float>* pTripToPan = nullptr;
+    std::atomic<float>* pRingOn = nullptr;
+    std::atomic<float>* pDownsample = nullptr;
 
     std::atomic<float>* pInput = nullptr;
     std::atomic<float>* pOutput = nullptr;

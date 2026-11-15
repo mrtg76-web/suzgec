@@ -24,6 +24,12 @@ int main(int argc, char** argv)
     proc.apvts.getParameter("resonance")->setValueNotifyingHost(0.55f);
     proc.apvts.getParameter("panOdd")->setValueNotifyingHost(0.2f);
     proc.apvts.getParameter("panEven")->setValueNotifyingHost(0.8f);
+    proc.apvts.getParameter("tripOn")->setValueNotifyingHost(1.f);
+    proc.apvts.getParameter("tripIntensity")->setValueNotifyingHost(0.7f);
+    proc.apvts.getParameter("tripShape")->setValueNotifyingHost(0.3f);
+    proc.apvts.getParameter("tripToPan")->setValueNotifyingHost(0.4f);
+    proc.apvts.getParameter("ringOn")->setValueNotifyingHost(1.f);
+    proc.setRingMask((1ull << 7) | (1ull << 19) | (1ull << 31) | (1ull << 40));
 
     // sayaçlar dolsun diye gürültü besle
     juce::AudioBuffer<float> buf(2, 512);
@@ -39,8 +45,9 @@ int main(int argc, char** argv)
     for (int pal : palettes) {
         proc.setPalette(pal);
         proc.setCrt(pal != 2);
+        proc.apvts.getParameter("tripSync")->setValueNotifyingHost(pal == 1 ? 1.f : 0.f);
         std::unique_ptr<juce::AudioProcessorEditor> ed(proc.createEditor());
-        ed->setSize(960, 600);
+        ed->setSize(960, 720);
         auto img = ed->createComponentSnapshot(ed->getLocalBounds(), true, 1.0f);
         auto file = outDir.getChildFile("suzgec_" + juce::String(pal) + ".png");
         file.deleteFile();

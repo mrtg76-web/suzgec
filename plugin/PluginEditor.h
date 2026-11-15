@@ -63,9 +63,22 @@ private:
     CrtLook& look;
     int hoverBand = -1;
     bool dragging = false;
-    juce::Point<float> lastPt;
+    bool pendingClick = false; // Ring Mod: tık mı sürükleme mi henüz belli değil
+    juce::Point<float> lastPt, downPt;
     std::array<bool, sz::kNumBands> touched {};
     std::array<float, sz::kNumBands> meterShown {};
+};
+
+// ---------------------------------------------------------------- Trip deseni (küçük ekran)
+class TripPattern : public juce::Component, private juce::Timer {
+public:
+    TripPattern(SuzgecProcessor&, CrtLook&);
+    void paint(juce::Graphics&) override;
+
+private:
+    void timerCallback() override { repaint(); }
+    SuzgecProcessor& proc;
+    CrtLook& look;
 };
 
 // ---------------------------------------------------------------- düğme
@@ -112,7 +125,7 @@ public:
 };
 
 // ---------------------------------------------------------------- içerik (sabit 960x600, ölçeklenir)
-class Content : public juce::Component {
+class Content : public juce::Component, private juce::Timer {
 public:
     Content(SuzgecProcessor&, CrtLook&);
     void paint(juce::Graphics&) override;
@@ -125,12 +138,14 @@ public:
 private:
     void showMenu();
     void buildOverlay();
+    void timerCallback() override;
 
     SuzgecProcessor& proc;
     CrtLook& look;
 
     BandDisplay display;
-    juce::TextButton flipBtn;
+    juce::TextButton flipBtn, ringBtn, ringRandomBtn, downsampleBtn;
+    juce::AudioProcessorValueTreeState::ButtonAttachment ringAtt, downsampleAtt;
     PaletteButton paletteBtn;
     juce::TextButton crtBtn, menuBtn;
 
@@ -139,8 +154,15 @@ private:
     juce::AudioProcessorValueTreeState::ButtonAttachment softClipAtt;
     Segmented shift, slope;
 
+    // Trip
+    juce::TextButton tripOnBtn, tripSyncBtn, tripPhaseBtn;
+    juce::AudioProcessorValueTreeState::ButtonAttachment tripOnAtt, tripSyncAtt, tripPhaseAtt;
+    Knob tripSpeed, tripDiv, tripIntensity, tripShape, tripToPan;
+    TripPattern tripPattern;
+    juce::ParameterAttachment syncWatch;
+
     juce::Image overlay;
-    juce::Rectangle<int> masterPanel, filterPanel, panPanel;
+    juce::Rectangle<int> masterPanel, filterPanel, panPanel, tripPanel;
 };
 
 class SuzgecEditor : public juce::AudioProcessorEditor {
@@ -149,7 +171,7 @@ public:
     ~SuzgecEditor() override;
     void resized() override;
 
-    static constexpr int kBaseW = 960, kBaseH = 600;
+    static constexpr int kBaseW = 960, kBaseH = 720;
 
 private:
     SuzgecProcessor& proc;

@@ -2,7 +2,7 @@
 
 Süzgeç, 48 bant geçiren filtreden oluşan bir ses efekti (VST3/AU). Bant merkezleri 55 Hz'den başlıyor ve 9:8 oranıyla (tam ses, 203.9 sent) ~13.9 kHz'e kadar diziliyor. Ekranda bir spektral şekil çizersin, gelen ses o şekle göre süzülür. Yüksek rezonansta camsı tınlamalar, derin vuruşlar ve metalik dokular çıkar.
 
-> **Faz 1.** Bu sürümde filtre bankası, çizim ekranı, Ana/Filtre/Pan bölümleri ve Ters Çevir var. Trip modülasyonu, Ring Mod ve Downsample 2. fazda; Spektral Yakalama (Analiz/Uygula), MIDI kontrolü, presetler ve oversampling 3. fazda gelecek.
+> **Faz 2.** Filtre bankası, çizim ekranı, Ana/Filtre/Pan, Ters Çevir, Trip modülasyonu, Ring Mod ve Downsample hazır. Spektral Yakalama (Analiz/Uygula), MIDI kontrolü, presetler ve oversampling 3. fazda gelecek.
 
 ## Kurulum (Mac)
 
@@ -53,6 +53,31 @@ Rezonans ve eğim değişince genel seviye otomatik telafi edilir: bütün bantl
 
 ### Pan
 Tek ve çift numaralı bantların stereo konumunu ayrı ayrı ayarlar. İkisini ortada bırakırsan görüntü ortada kalır. Zıt taraflara koyarsan genişlik elde edersin.
+
+### Trip
+Bant seviyelerini ve stereo alanı hareketlendirir. Çizdiğin şekil kayıtlı kalır; Trip onu canlandırır. Ekranda dolgu canlı seviyeyi, ince çizgi kayıtlı seviyeyi gösterir.
+
+| Ayar | Ne yapar |
+|---|---|
+| Açık | Trip'i açar/kapatır. |
+| Hız | 0.01 Hz – 2 kHz. Yüksek hızlarda (ses frekansında) genlik modülasyonu gibi davranır. |
+| Senk | Hızı host temposuna kilitler: 64 ölçü … 1/64, noktalı (D) ve üçleme (T) dahil. Ölçü = 4 vuruş. Çalarken faz şarkı konumuna kilitlenir, yani her çalışta aynı yerden başlar. |
+| Yoğunluk | Bant seviyesi modülasyonunun derinliği. %0'da seviyeler değişmez. |
+| Şekil | Desen: sıralı dalga (bantlar sırayla) → tek/çift dönüşümlü → karışık. Pan hareketini de düzgün salınımdan düzensize doğru değiştirir. |
+| Ters Yön | Trip döngüsünün yönünü çevirir. |
+| Pan'a | Trip'in stereo konumu ne kadar hareket ettireceği. Yoğunluk %0 olsa da çalışır (Trip açık olmalı). |
+
+Sağdaki **Desen** ekranında noktalar her bandın faz kaymasını, çizgi o anki fazı, alttaki çubuklar bantların o anki seviye çarpanını gösterir.
+
+### Ring Mod
+1. **RING MOD**'u aç.
+2. Ekranda bantlara **tıklayarak** seç ya da bırak (seçili bantların üstünde ◆ belirir). Sürüklemek yine seviye çizer.
+3. Seçili bantların filtrelenmiş sesi taşıyıcı olur ve işlenmiş sesi çarpar: metalik, inharmonik dokular.
+
+**RASTGELE**, seçim yokken 3–5 rastgele bant seçer; seçim varken düğme **TEMİZLE** olur. Seçili bantların seviyeleri ve Trip, taşıyıcıyı da etkiler. Taşıyıcının seviyesi otomatik dengelenir, böylece ses kaybolmaz. Seçim yoksa ses modüle edilmez. Seçim projeyle ve presetle birlikte kaydedilir.
+
+### Downsample ÷4
+İşlenmiş sesi host örnekleme hızının dörtte birine düşürür (48 kHz projede 12 kHz). Filtre olmadan örnek tuttuğu için kasıtlı olarak kaba ve aliasing'li bir ses verir. Ring Mod ve Downsample karışımdan önce çalışır; dokuyu orijinalle harmanlamak için Karışım'ı düşür.
 
 ### Görünüm
 - **Renk düğmesi** (YEŞİL, TURUNCU, MAVİ, KIRMIZI, SARI, MOR, S/B): tıklayınca sonraki renk, sağ tıklayınca önceki renk.
