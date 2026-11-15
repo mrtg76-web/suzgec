@@ -292,8 +292,8 @@ void BandDisplay::paint(juce::Graphics& g)
     for (int b = 0; b < sz::kNumBands; b += 6) {
         const double hz = sz::bandFrequency(b);
         const juce::String t = hz >= 1000 ? juce::String(hz / 1000.0, 1) + "k" : juce::String(juce::roundToInt(hz));
-        g.drawText(t, juce::Rectangle<float>(p.getX() + b * bw - 10.f, p.getBottom() + 3.f, 40.f, 14.f),
-                   juce::Justification::centredLeft);
+        g.drawText(t, juce::Rectangle<float>(p.getX() + (b + 0.5f) * bw - 20.f, p.getBottom() + 3.f, 40.f, 14.f),
+                   juce::Justification::centred);
     }
 
     // durum satırı
@@ -542,7 +542,7 @@ void Content::paint(juce::Graphics& g)
     };
     drawPanel(masterPanel, TR("ANA"));
     drawPanel(filterPanel, TR("FİLTRE"));
-    drawPanel(panPanel, TR("PAN  ·  TEK / ÇİFT BANTLAR"));
+    drawPanel(panPanel, TR("PAN"));
 }
 
 void Content::buildOverlay()

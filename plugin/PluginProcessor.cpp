@@ -5,7 +5,11 @@ namespace {
 const juce::Identifier kPalette("palette"), kCrt("crt"), kUiWidth("uiWidth");
 constexpr const char* kPresetPrefix = "SUZGEC1:";
 
-juce::String dbText(float v, int) { return (v > 0.05f ? "+" : "") + juce::String(v, 1) + " dB"; }
+juce::String dbText(float v, int)
+{
+    if (std::abs(v) < 0.05f) return "0.0 dB";
+    return (v > 0.f ? "+" : "") + juce::String(v, 1) + " dB";
+}
 juce::String pctText(float v, int) { return juce::String(juce::roundToInt(v)) + "%"; }
 juce::String panText(float v, int)
 {
