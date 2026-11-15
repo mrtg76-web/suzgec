@@ -503,7 +503,7 @@ Content::Content(SuzgecProcessor& p, CrtLook& l)
         timerCallback();
     };
     addAndMakeVisible(ringRandomBtn);
-    downsampleBtn.setButtonText(TR("DOWNSAMPLE ÷4"));
+    downsampleBtn.setButtonText(TR("DOWNSAMPLE 1/4"));
     downsampleBtn.setClickingTogglesState(true);
     downsampleBtn.setTooltip(TR("İşlenmiş sesi host örnekleme hızının dörtte birine düşürür"));
     addAndMakeVisible(downsampleBtn);

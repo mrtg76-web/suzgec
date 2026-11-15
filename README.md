@@ -76,7 +76,7 @@ Sağdaki **Desen** ekranında noktalar her bandın faz kaymasını, çizgi o ank
 
 **RASTGELE**, seçim yokken 3–5 rastgele bant seçer; seçim varken düğme **TEMİZLE** olur. Seçili bantların seviyeleri ve Trip, taşıyıcıyı da etkiler. Taşıyıcının seviyesi otomatik dengelenir, böylece ses kaybolmaz. Seçim yoksa ses modüle edilmez. Seçim projeyle ve presetle birlikte kaydedilir.
 
-### Downsample ÷4
+### Downsample 1/4
 İşlenmiş sesi host örnekleme hızının dörtte birine düşürür (48 kHz projede 12 kHz). Filtre olmadan örnek tuttuğu için kasıtlı olarak kaba ve aliasing'li bir ses verir. Ring Mod ve Downsample karışımdan önce çalışır; dokuyu orijinalle harmanlamak için Karışım'ı düşür.
 
 ### Görünüm
