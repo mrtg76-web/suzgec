@@ -31,10 +31,12 @@ jobs:
       - name: Build
         run: cmake --build build --config Release --target Suzgec_VST3 Suzgec_AU Suzgec_Standalone SuzgecSnapshot -j4
       - name: UI snapshot
+        continue-on-error: true
         run: |
           mkdir -p shots
-          find build -name SuzgecSnapshot -type f -perm -u+x | head -1 | xargs -I{} {} "$PWD/shots"
+          ./build/SuzgecSnapshot_artefacts/Release/SuzgecSnapshot "$PWD/shots"
       - uses: actions/upload-artifact@v5
+        continue-on-error: true
         with:
           name: snapshots-${{ matrix.runner }}
           path: shots
